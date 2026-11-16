@@ -78,11 +78,12 @@ defmodule Quicksand do
   @spec eval(runtime(), String.t(), map()) :: js_result()
   def eval(runtime, code, callbacks) when is_map(callbacks) do
     fn_names = Map.keys(callbacks)
+    tag = :erlang.unique_integer([:positive])
 
-    case Quicksand.Native.eval_with_callbacks(runtime, code, fn_names) do
+    case Quicksand.Native.eval_with_callbacks(runtime, code, fn_names, tag) do
       {:ok, _} ->
         timeout = Quicksand.Native.get_timeout(runtime)
-        callback_loop(runtime, callbacks, timeout)
+        callback_loop(runtime, callbacks, timeout, tag)
 
       {:error, _} = error ->
         error
@@ -105,15 +106,15 @@ defmodule Quicksand do
     :error, :badarg -> :ok
   end
 
-  defp callback_loop(runtime, callbacks, timeout) do
+  defp callback_loop(runtime, callbacks, timeout, tag) do
     receive do
-      {:quicksand_result, {:ok, value}} ->
+      {:quicksand_result, ^tag, {:ok, value}} ->
         {:ok, value}
 
-      {:quicksand_result, {:error, reason}} ->
+      {:quicksand_result, ^tag, {:error, reason}} ->
         {:error, reason}
 
-      {:quicksand_callback, id, name, args} ->
+      {:quicksand_callback, ^tag, id, name, args} ->
         result =
           case Map.fetch(callbacks, name) do
             {:ok, fun} ->
@@ -137,10 +138,10 @@ defmodule Quicksand do
 
         result = validate_callback_result(result)
         Quicksand.Native.respond_callback(runtime, id, result)
-        callback_loop(runtime, callbacks, timeout)
+        callback_loop(runtime, callbacks, timeout, tag)
     after
       timeout ->
-        Quicksand.Native.interrupt(runtime)
+        Quicksand.Native.interrupt(runtime, tag)
         {:error, "timeout"}
     end
   end

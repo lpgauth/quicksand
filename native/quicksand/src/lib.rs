@@ -86,13 +86,14 @@ fn eval_with_callbacks(
     resource: ResourceArc<runtime::Runtime>,
     code: String,
     fn_names: Vec<String>,
+    tag: u64,
 ) -> JsResult {
     let pid = env.pid();
     let callbacks = Arc::clone(&resource.callbacks);
     let timeout = resource.timeout;
     if resource
         .send(worker::Message::EvalWithCallbacks(
-            code, fn_names, callbacks, pid, timeout,
+            code, fn_names, callbacks, pid, timeout, tag,
         ))
         .is_err()
     {
@@ -147,7 +148,8 @@ fn is_alive(resource: ResourceArc<runtime::Runtime>) -> bool {
 }
 
 #[rustler::nif]
-fn interrupt(resource: ResourceArc<runtime::Runtime>) -> rustler::Atom {
+fn interrupt(resource: ResourceArc<runtime::Runtime>, tag: u64) -> rustler::Atom {
+    resource.callbacks.abandon(tag);
     resource.interrupt.store(true, Ordering::Relaxed);
     atoms::ok()
 }

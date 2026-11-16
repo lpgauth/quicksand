@@ -332,7 +332,7 @@ defmodule QuicksandTest do
 
       assert {:error, "timeout"} = Quicksand.eval(rt, code, callbacks)
       assert {:ok, 42} = Quicksand.eval(rt, "21 * 2")
-      refute_received {:quicksand_callback, _, _, _}
+      refute_received {:quicksand_callback, _, _, _, _}
       assert :ok = Quicksand.stop(rt)
     end
 
@@ -393,6 +393,16 @@ defmodule QuicksandTest do
 
       assert {:ok, 1} = Quicksand.eval(rt, "1")
       Quicksand.stop(rt)
+    end
+
+    test "timed-out eval with callbacks does not leak its result" do
+      {:ok, rt} = Quicksand.start(timeout: 100)
+      callbacks = %{"noop" => fn [] -> {:ok, nil} end}
+      assert {:error, "timeout"} = Quicksand.eval(rt, "while(true) {}", callbacks)
+      assert {:ok, 42} = Quicksand.eval(rt, "21 * 2", callbacks)
+      assert {:ok, 42} = Quicksand.eval(rt, "21 * 2")
+      refute_received {:quicksand_result, _, _}
+      assert :ok = Quicksand.stop(rt)
     end
 
     test "memory limit" do

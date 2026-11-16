@@ -24,6 +24,7 @@ pub enum Message {
         Arc<CallbackRegistry>,
         LocalPid,
         Duration,
+        u64,
     ),
 }
 
@@ -87,23 +88,26 @@ impl Worker {
                     let result = self.eval(&code);
                     let _ = tx.send(result);
                 }
-                Message::EvalWithCallbacks(code, fn_names, callbacks, caller_pid, timeout) => {
+                Message::EvalWithCallbacks(code, fn_names, callbacks, caller_pid, timeout, tag) => {
                     self.interrupt.store(false, Ordering::Relaxed);
                     let result = match self.install_callback_functions(
                         &fn_names,
                         &callbacks,
                         &caller_pid,
                         timeout,
+                        tag,
                     ) {
                         Ok(()) => self.eval(&code),
                         Err(e) => Err(e),
                     };
                     self.remove_callback_functions(&fn_names);
                     callbacks.clear();
-                    send_to_pid(
-                        &caller_pid,
-                        (atoms::quicksand_result(), JsResult::from(result)),
-                    );
+                    if !callbacks.is_abandoned(tag) {
+                        send_to_pid(
+                            &caller_pid,
+                            (atoms::quicksand_result(), tag, JsResult::from(result)),
+                        );
+                    }
                 }
                 Message::Stop(tx) => {
                     let _ = tx.send(());
@@ -148,6 +152,7 @@ impl Worker {
         callbacks: &Arc<CallbackRegistry>,
         caller_pid: &LocalPid,
         timeout: Duration,
+        tag: u64,
     ) -> Result<(), String> {
         let cb = Arc::clone(callbacks);
         let pid = *caller_pid;
@@ -190,7 +195,13 @@ impl Worker {
 
                     send_to_pid(
                         &pid,
-                        (atoms::quicksand_callback(), id, name.clone(), callback_args),
+                        (
+                            atoms::quicksand_callback(),
+                            tag,
+                            id,
+                            name.clone(),
+                            callback_args,
+                        ),
                     );
 
                     match rx.recv_timeout(timeout) {
