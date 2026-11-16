@@ -25,7 +25,7 @@ Add to your `mix.exs`:
 ```elixir
 def deps do
   [
-    {:quicksand, "~> 0.1.0"}
+    {:quicksand, "~> 0.2.0"}
   ]
 end
 ```
