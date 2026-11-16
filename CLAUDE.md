@@ -54,7 +54,7 @@ Each eval/3 call passes a unique `tag` that the worker puts in every message, so
 ### Callback Mechanism
 
 - `__quicksand_dispatch`: Rust native function installed per eval/3 call. Reads args from `__quicksand_cb_args` global, sends to Elixir via `send_to_pid`, blocks on `CallbackRegistry` channel for response.
-- `__quicksand_make_wrapper`: Persistent JS factory (installed once in `Worker::new`, frozen via `Object.defineProperty`). Creates per-callback wrapper functions that set args global, call dispatch, retrieve result from `__quicksand_cb_result` global.
+- `__quicksand_make_wrapper`: Persistent JS factory (installed once in `Worker::try_new`, frozen via `Object.defineProperty`). Creates per-callback wrapper functions that set args global, call dispatch, retrieve result from `__quicksand_cb_result` global.
 - Callback names are passed as JS function parameters to the factory, never interpolated into eval'd code (prevents JS injection).
 
 ### Type Conversion
@@ -73,7 +73,12 @@ The `interrupt` `Arc<AtomicBool>` is shared between the NIF side and the worker.
 
 - `lib/quicksand.ex` — public API, callback receive loop, validation
 - `lib/quicksand/native.ex` — RustlerPrecompiled NIF stubs (set `QUICKSAND_BUILD=true` to compile from source)
-- `native/quicksand/src/lib.rs` — NIF entry points
+- `native/quicksand/src/lib.rs` — module declarations and `rustler::init!`
+- `native/quicksand/src/nif.rs` — NIF entry points
 - `native/quicksand/src/worker.rs` — worker thread, QuickJS eval, callback dispatch
 - `native/quicksand/src/convert.rs` — bidirectional type conversion (JS ↔ Erlang)
 - `native/quicksand/src/runtime.rs` — Runtime resource, CallbackRegistry, `send_to_pid`
+
+### Rust Style
+
+Rust code follows the [Google Rust style guide](https://google.github.io/styleguide/rustguide.html). Clippy enforces the rules it can check through `[lints.clippy]` in `native/quicksand/Cargo.toml`.

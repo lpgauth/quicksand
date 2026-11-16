@@ -1,11 +1,28 @@
-use crate::atoms;
-use rustler::{Encoder, Env, Term};
+//! Conversion between QuickJS values and Erlang terms.
+//!
+//! JS to Erlang happens on the worker thread in one step. Erlang to JS takes
+//! two: NIF threads can read terms but not JS values, and the worker thread
+//! the reverse, so terms are first decoded into a `TermValue`.
 
+use std::borrow::Cow;
+
+use rquickjs::{Array, Ctx, Object, Value};
+use rustler::types::atom;
+use rustler::{Encoder, Env, MapIterator, Term};
+
+/// Containers nested deeper than this fail to convert, which also stops cycles.
 const MAX_DEPTH: u32 = 64;
+
+/// The largest integer a JS number holds exactly (`Number.MAX_SAFE_INTEGER`).
+const MAX_SAFE_INTEGER: f64 = 9_007_199_254_740_991.0;
+
+/// A callback's reply: the value to return to JS, or the message to throw.
+pub type CallbackReply = Result<TermValue, String>;
 
 // ── JS → Erlang ─────────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone)]
+/// A JS value copied out of the runtime, ready to encode as an Erlang term.
+#[derive(Clone, Debug)]
 pub enum JsValue {
     Null,
     Bool(bool),
@@ -19,141 +36,119 @@ pub enum JsValue {
 impl Encoder for JsValue {
     fn encode<'a>(&self, env: Env<'a>) -> Term<'a> {
         match self {
-            JsValue::Null => rustler::types::atom::nil().encode(env),
-            JsValue::Bool(b) => b.encode(env),
-            JsValue::Int(n) => n.encode(env),
-            JsValue::Float(f) => f.encode(env),
-            JsValue::String(s) => s.encode(env),
-            JsValue::Array(arr) => arr.encode(env),
+            JsValue::Null => atom::nil().encode(env),
+            JsValue::Bool(boolean) => boolean.encode(env),
+            JsValue::Int(integer) => integer.encode(env),
+            JsValue::Float(float) => float.encode(env),
+            JsValue::String(string) => string.encode(env),
+            JsValue::Array(items) => items.encode(env),
             JsValue::Object(pairs) => {
-                let keys: Vec<Term> = pairs.iter().map(|(k, _)| k.encode(env)).collect();
-                let vals: Vec<Term> = pairs.iter().map(|(_, v)| v.encode(env)).collect();
-                Term::map_from_arrays(env, &keys, &vals)
-                    .unwrap_or_else(|_| rustler::types::atom::nil().encode(env))
+                let keys: Vec<Term> = pairs.iter().map(|(key, _)| key.encode(env)).collect();
+                let values: Vec<Term> = pairs.iter().map(|(_, value)| value.encode(env)).collect();
+                Term::map_from_arrays(env, &keys, &values)
+                    .unwrap_or_else(|_| atom::nil().encode(env))
             }
         }
     }
 }
 
-pub enum JsResult {
-    Ok(JsValue),
-    Err(String),
+pub fn js_to_term<'js>(ctx: &Ctx<'js>, value: Value<'js>) -> Result<JsValue, String> {
+    js_to_term_at_depth(ctx, value, 0)
 }
 
-impl From<Result<JsValue, String>> for JsResult {
-    fn from(result: Result<JsValue, String>) -> Self {
-        match result {
-            Ok(val) => JsResult::Ok(val),
-            Err(err) => JsResult::Err(err),
-        }
-    }
-}
-
-impl Encoder for JsResult {
-    fn encode<'a>(&self, env: Env<'a>) -> Term<'a> {
-        match self {
-            JsResult::Ok(val) => (atoms::ok(), val).encode(env),
-            JsResult::Err(msg) => (atoms::error(), msg.as_str()).encode(env),
-        }
-    }
-}
-
-pub fn js_to_term<'js>(
-    ctx: &rquickjs::Ctx<'js>,
-    val: rquickjs::Value<'js>,
-) -> Result<JsValue, String> {
-    js_to_term_depth(ctx, val, 0)
-}
-
-fn js_to_term_depth<'js>(
-    ctx: &rquickjs::Ctx<'js>,
-    val: rquickjs::Value<'js>,
+fn js_to_term_at_depth<'js>(
+    ctx: &Ctx<'js>,
+    value: Value<'js>,
     depth: u32,
 ) -> Result<JsValue, String> {
     if depth > MAX_DEPTH {
         return Err("Maximum nesting depth exceeded".to_string());
     }
 
-    if val.is_undefined() || val.is_null() {
+    if value.is_undefined() || value.is_null() || value.is_function() {
         return Ok(JsValue::Null);
     }
 
-    if let Some(b) = val.as_bool() {
-        return Ok(JsValue::Bool(b));
+    if let Some(boolean) = value.as_bool() {
+        return Ok(JsValue::Bool(boolean));
     }
 
-    if let Some(n) = val.as_int() {
-        return Ok(JsValue::Int(n as i64));
+    if let Some(integer) = value.as_int() {
+        return Ok(JsValue::Int(i64::from(integer)));
     }
 
-    if let Some(f) = val.as_float() {
-        if !f.is_finite() {
-            return Ok(JsValue::Null);
-        }
-        if f.fract() == 0.0 && f.abs() <= 9_007_199_254_740_991.0 {
-            return Ok(JsValue::Int(f as i64));
-        }
-        return Ok(JsValue::Float(f));
+    if let Some(float) = value.as_float() {
+        return Ok(float_to_term(float));
     }
 
-    if let Some(s) = val.as_string() {
-        return Ok(JsValue::String(
-            s.to_string()
-                .map_err(|e| format!("String conversion error: {e}"))?,
-        ));
+    if let Some(string) = value.as_string() {
+        let string = string
+            .to_string()
+            .map_err(|error| format!("String conversion error: {error}"))?;
+        return Ok(JsValue::String(string));
     }
 
-    if val.is_function() {
+    let Some(object) = value.as_object() else {
         return Ok(JsValue::Null);
-    }
+    };
 
-    if val.is_array() {
-        if let Some(obj) = val.as_object() {
-            let length: i32 = obj.get("length").unwrap_or(0);
-            let length = length.max(0) as u32;
-            let mut result = Vec::with_capacity((length as usize).min(1024));
-            for i in 0..length {
-                let item: rquickjs::Value = obj
-                    .get(i)
-                    .unwrap_or(rquickjs::Value::new_undefined(ctx.clone()));
-                result.push(js_to_term_depth(ctx, item, depth + 1)?);
-            }
-            return Ok(JsValue::Array(result));
+    if value.is_array() {
+        array_to_term(ctx, object, depth).map(JsValue::Array)
+    } else {
+        object_to_term(ctx, object, depth).map(JsValue::Object)
+    }
+}
+
+fn float_to_term(float: f64) -> JsValue {
+    if !float.is_finite() {
+        JsValue::Null
+    } else if float.fract() == 0.0 && float.abs() <= MAX_SAFE_INTEGER {
+        JsValue::Int(float as i64)
+    } else {
+        JsValue::Float(float)
+    }
+}
+
+fn array_to_term<'js>(
+    ctx: &Ctx<'js>,
+    array: &Object<'js>,
+    depth: u32,
+) -> Result<Vec<JsValue>, String> {
+    let length: i32 = array.get("length").unwrap_or(0);
+    let length = u32::try_from(length).unwrap_or(0);
+    let mut items = Vec::with_capacity(length.min(1024) as usize);
+    for index in 0..length {
+        let item: Value = array
+            .get(index)
+            .unwrap_or_else(|_| Value::new_undefined(ctx.clone()));
+        items.push(js_to_term_at_depth(ctx, item, depth + 1)?);
+    }
+    Ok(items)
+}
+
+fn object_to_term<'js>(
+    ctx: &Ctx<'js>,
+    object: &Object<'js>,
+    depth: u32,
+) -> Result<Vec<(String, JsValue)>, String> {
+    let mut pairs = Vec::new();
+    let keys = object.keys::<String>().flatten();
+    for key in keys {
+        let value: Value = object
+            .get(key.as_str())
+            .unwrap_or_else(|_| Value::new_undefined(ctx.clone()));
+        if !value.is_function() {
+            pairs.push((key, js_to_term_at_depth(ctx, value, depth + 1)?));
         }
     }
-
-    if val.is_object() {
-        if let Some(obj) = val.as_object() {
-            let mut pairs = Vec::new();
-            for key in obj.keys::<String>().flatten() {
-                let v: rquickjs::Value = obj
-                    .get(&*key)
-                    .unwrap_or(rquickjs::Value::new_undefined(ctx.clone()));
-                if !v.is_function() {
-                    pairs.push((key, js_to_term_depth(ctx, v, depth + 1)?));
-                }
-            }
-            return Ok(JsValue::Object(pairs));
-        }
-    }
-
-    Ok(JsValue::Null)
+    Ok(pairs)
 }
 
 // ── Erlang → JS ─────────────────────────────────────────────────────────────
 
-/// Represents a callback result sent from Elixir back to JS.
-/// We use an enum to distinguish ok/error at the Rust level,
-/// then convert to JS value or throw.
-pub enum CallbackResult {
-    Ok(TermValue),
-    Err(String),
-}
-
-/// Intermediate representation of an Erlang term for conversion to JS.
-/// Decoded from Erlang terms on the NIF side, then converted to rquickjs
-/// values on the worker thread.
-#[derive(Debug, Clone)]
+/// An Erlang term decoded on a NIF thread, ready to become a JS value on the
+/// worker thread.
+#[derive(Clone, Debug)]
 pub enum TermValue {
     Nil,
     Bool(bool),
@@ -165,70 +160,62 @@ pub enum TermValue {
     Map(Vec<(TermValue, TermValue)>),
 }
 
-/// Decode a rustler Term into a TermValue.
-/// Called on the NIF thread (has access to Env).
-pub fn term_to_intermediate<'a>(term: Term<'a>) -> Result<TermValue, String> {
-    term_to_intermediate_depth(term, 0)
+pub fn term_to_intermediate(term: Term<'_>) -> Result<TermValue, String> {
+    term_to_intermediate_at_depth(term, 0)
 }
 
-fn term_to_intermediate_depth<'a>(term: Term<'a>, depth: u32) -> Result<TermValue, String> {
+fn term_to_intermediate_at_depth(term: Term<'_>, depth: u32) -> Result<TermValue, String> {
     if depth > MAX_DEPTH {
         return Err("Maximum nesting depth exceeded".to_string());
     }
 
-    // nil
     if term.is_atom() {
-        let atom_str: String = term
+        let name = term
             .atom_to_string()
             .map_err(|_| "Failed to convert atom".to_string())?;
-        return match atom_str.as_str() {
-            "nil" => Ok(TermValue::Nil),
-            "true" => Ok(TermValue::Bool(true)),
-            "false" => Ok(TermValue::Bool(false)),
-            _ => Ok(TermValue::Atom(atom_str)),
-        };
+        return Ok(match name.as_str() {
+            "nil" => TermValue::Nil,
+            "true" => TermValue::Bool(true),
+            "false" => TermValue::Bool(false),
+            _ => TermValue::Atom(name),
+        });
     }
 
-    // integer
-    if let Ok(n) = term.decode::<i64>() {
-        return Ok(TermValue::Int(n));
+    if let Ok(integer) = term.decode::<i64>() {
+        return Ok(TermValue::Int(integer));
     }
 
-    // float
-    if let Ok(f) = term.decode::<f64>() {
-        return Ok(TermValue::Float(f));
+    if let Ok(float) = term.decode::<f64>() {
+        return Ok(TermValue::Float(float));
     }
 
-    // binary/string
     if term.is_binary() {
-        let s: String = term
+        let string: String = term
             .decode()
             .map_err(|_| "Failed to decode binary as UTF-8 string".to_string())?;
-        return Ok(TermValue::String(s));
+        return Ok(TermValue::String(string));
     }
 
-    // list
     if term.is_list() {
         let items: Vec<Term> = term
             .decode()
             .map_err(|_| "Failed to decode list".to_string())?;
-        let mut result = Vec::with_capacity(items.len());
+        let mut values = Vec::with_capacity(items.len());
         for item in items {
-            result.push(term_to_intermediate_depth(item, depth + 1)?);
+            values.push(term_to_intermediate_at_depth(item, depth + 1)?);
         }
-        return Ok(TermValue::List(result));
+        return Ok(TermValue::List(values));
     }
 
-    // map
     if term.is_map() {
-        let iter: rustler::MapIterator = term
+        let entries: MapIterator = term
             .decode()
             .map_err(|_| "Failed to decode map".to_string())?;
         let mut pairs = Vec::new();
-        for (k, v) in iter {
-            let key = term_to_intermediate_depth(k, depth + 1)?;
-            let val = term_to_intermediate_depth(v, depth + 1)?;
-            pairs.push((key, val));
+        for (key, value) in entries {
+            let key = term_to_intermediate_at_depth(key, depth + 1)?;
+            let value = term_to_intermediate_at_depth(value, depth + 1)?;
+            pairs.push((key, value));
         }
         return Ok(TermValue::Map(pairs));
     }
@@ -236,71 +223,61 @@ fn term_to_intermediate_depth<'a>(term: Term<'a>, depth: u32) -> Result<TermValu
     Err("Unsupported Elixir term type".to_string())
 }
 
-/// Convert a TermValue to a rquickjs Value.
-/// Called on the worker thread (has access to rquickjs Ctx).
 pub fn intermediate_to_js<'js>(
-    ctx: &rquickjs::Ctx<'js>,
-    tv: &TermValue,
-) -> Result<rquickjs::Value<'js>, String> {
-    intermediate_to_js_depth(ctx, tv, 0)
+    ctx: &Ctx<'js>,
+    term_value: &TermValue,
+) -> Result<Value<'js>, String> {
+    intermediate_to_js_at_depth(ctx, term_value, 0)
 }
 
-fn intermediate_to_js_depth<'js>(
-    ctx: &rquickjs::Ctx<'js>,
-    tv: &TermValue,
+fn intermediate_to_js_at_depth<'js>(
+    ctx: &Ctx<'js>,
+    term_value: &TermValue,
     depth: u32,
-) -> Result<rquickjs::Value<'js>, String> {
+) -> Result<Value<'js>, String> {
     if depth > MAX_DEPTH {
         return Err("Maximum nesting depth exceeded".to_string());
     }
 
-    match tv {
-        TermValue::Nil => Ok(rquickjs::Value::new_null(ctx.clone())),
-        TermValue::Bool(b) => Ok(rquickjs::Value::new_bool(ctx.clone(), *b)),
-        TermValue::Int(n) => {
-            if *n >= i32::MIN as i64 && *n <= i32::MAX as i64 {
-                Ok(rquickjs::Value::new_int(ctx.clone(), *n as i32))
-            } else {
-                Ok(rquickjs::Value::new_float(ctx.clone(), *n as f64))
-            }
-        }
-        TermValue::Float(f) => Ok(rquickjs::Value::new_float(ctx.clone(), *f)),
-        TermValue::String(s) => {
-            let js_str = rquickjs::String::from_str(ctx.clone(), s)
-                .map_err(|e| format!("Failed to create JS string: {e}"))?;
-            Ok(js_str.into())
-        }
-        TermValue::Atom(s) => {
-            let js_str = rquickjs::String::from_str(ctx.clone(), s)
-                .map_err(|e| format!("Failed to create JS string: {e}"))?;
-            Ok(js_str.into())
+    match term_value {
+        TermValue::Nil => Ok(Value::new_null(ctx.clone())),
+        TermValue::Bool(boolean) => Ok(Value::new_bool(ctx.clone(), *boolean)),
+        TermValue::Int(integer) => Ok(match i32::try_from(*integer) {
+            Ok(small) => Value::new_int(ctx.clone(), small),
+            Err(_) => Value::new_float(ctx.clone(), *integer as f64),
+        }),
+        TermValue::Float(float) => Ok(Value::new_float(ctx.clone(), *float)),
+        TermValue::String(string) | TermValue::Atom(string) => {
+            let string = rquickjs::String::from_str(ctx.clone(), string)
+                .map_err(|error| format!("Failed to create JS string: {error}"))?;
+            Ok(string.into_value())
         }
         TermValue::List(items) => {
-            let array = rquickjs::Array::new(ctx.clone())
-                .map_err(|e| format!("Failed to create JS array: {e}"))?;
-            for (i, item) in items.iter().enumerate() {
-                let val = intermediate_to_js_depth(ctx, item, depth + 1)?;
+            let array = Array::new(ctx.clone())
+                .map_err(|error| format!("Failed to create JS array: {error}"))?;
+            for (index, item) in items.iter().enumerate() {
+                let value = intermediate_to_js_at_depth(ctx, item, depth + 1)?;
                 array
-                    .set(i, val)
-                    .map_err(|e| format!("Failed to set array element: {e}"))?;
+                    .set(index, value)
+                    .map_err(|error| format!("Failed to set array element: {error}"))?;
             }
             Ok(array.into_value())
         }
         TermValue::Map(pairs) => {
-            let obj = rquickjs::Object::new(ctx.clone())
-                .map_err(|e| format!("Failed to create JS object: {e}"))?;
-            for (k, v) in pairs {
-                let key_str = match k {
-                    TermValue::String(s) => s.clone(),
-                    TermValue::Atom(s) => s.clone(),
-                    TermValue::Int(n) => n.to_string(),
+            let object = Object::new(ctx.clone())
+                .map_err(|error| format!("Failed to create JS object: {error}"))?;
+            for (key, value) in pairs {
+                let key: Cow<'_, str> = match key {
+                    TermValue::String(string) | TermValue::Atom(string) => Cow::Borrowed(string),
+                    TermValue::Int(integer) => Cow::Owned(integer.to_string()),
                     _ => return Err("Map keys must be strings, atoms, or integers".to_string()),
                 };
-                let val = intermediate_to_js_depth(ctx, v, depth + 1)?;
-                obj.set(&*key_str, val)
-                    .map_err(|e| format!("Failed to set object property: {e}"))?;
+                let value = intermediate_to_js_at_depth(ctx, value, depth + 1)?;
+                object
+                    .set(key.as_ref(), value)
+                    .map_err(|error| format!("Failed to set object property: {error}"))?;
             }
-            Ok(obj.into_value())
+            Ok(object.into_value())
         }
     }
 }
