@@ -10,6 +10,11 @@ use rustler::LocalPid;
 
 type ResultSender = std::sync::mpsc::Sender<Result<JsValue, String>>;
 
+// QuickJS cannot discard queued jobs, so after an interrupt the remaining ones
+// still run (and abort at their next interrupt check) instead of leaking into
+// the next eval. Short jobs can keep queueing more, so the drain is capped.
+const MAX_JOBS_AFTER_INTERRUPT: usize = 10_000;
+
 pub enum Message {
     Eval(String, ResultSender),
     Stop(std::sync::mpsc::Sender<()>),
@@ -19,6 +24,7 @@ pub enum Message {
         Arc<CallbackRegistry>,
         LocalPid,
         Duration,
+        u64,
     ),
 }
 
@@ -82,23 +88,26 @@ impl Worker {
                     let result = self.eval(&code);
                     let _ = tx.send(result);
                 }
-                Message::EvalWithCallbacks(code, fn_names, callbacks, caller_pid, timeout) => {
+                Message::EvalWithCallbacks(code, fn_names, callbacks, caller_pid, timeout, tag) => {
                     self.interrupt.store(false, Ordering::Relaxed);
                     let result = match self.install_callback_functions(
                         &fn_names,
                         &callbacks,
                         &caller_pid,
                         timeout,
+                        tag,
                     ) {
                         Ok(()) => self.eval(&code),
                         Err(e) => Err(e),
                     };
                     self.remove_callback_functions(&fn_names);
                     callbacks.clear();
-                    send_to_pid(
-                        &caller_pid,
-                        (atoms::quicksand_result(), JsResult::from(result)),
-                    );
+                    if !callbacks.is_abandoned(tag) {
+                        send_to_pid(
+                            &caller_pid,
+                            (atoms::quicksand_result(), tag, JsResult::from(result)),
+                        );
+                    }
                 }
                 Message::Stop(tx) => {
                     let _ = tx.send(());
@@ -109,11 +118,13 @@ impl Worker {
     }
 
     fn drain_jobs(&self) {
-        loop {
-            match self.rt.execute_pending_job() {
-                Ok(false) => break,
-                Ok(true) => continue,
-                Err(_) => break,
+        let mut budget = MAX_JOBS_AFTER_INTERRUPT;
+        while !matches!(self.rt.execute_pending_job(), Ok(false)) {
+            if self.interrupt.load(Ordering::Relaxed) {
+                budget -= 1;
+                if budget == 0 {
+                    break;
+                }
             }
         }
     }
@@ -141,9 +152,11 @@ impl Worker {
         callbacks: &Arc<CallbackRegistry>,
         caller_pid: &LocalPid,
         timeout: Duration,
+        tag: u64,
     ) -> Result<(), String> {
         let cb = Arc::clone(callbacks);
         let pid = *caller_pid;
+        let interrupt = Arc::clone(&self.interrupt);
 
         self.ctx.with(|ctx| {
             let globals = ctx.globals();
@@ -155,6 +168,18 @@ impl Worker {
             let dispatch = Function::new(
                 ctx.clone(),
                 move |ctx: rquickjs::Ctx<'_>, name: String| -> rquickjs::Result<String> {
+                    if interrupt.load(Ordering::Relaxed) {
+                        ctx.throw(
+                            rquickjs::String::from_str(
+                                ctx.clone(),
+                                &format!("Callback '{}' called after interrupt", name),
+                            )
+                            .map_err(|_| rquickjs::Error::Exception)?
+                            .into(),
+                        );
+                        return Err(rquickjs::Error::Exception);
+                    }
+
                     let args_val: rquickjs::Value = ctx
                         .globals()
                         .get("__quicksand_cb_args")
@@ -170,7 +195,13 @@ impl Worker {
 
                     send_to_pid(
                         &pid,
-                        (atoms::quicksand_callback(), id, name.clone(), callback_args),
+                        (
+                            atoms::quicksand_callback(),
+                            tag,
+                            id,
+                            name.clone(),
+                            callback_args,
+                        ),
                     );
 
                     match rx.recv_timeout(timeout) {
@@ -260,6 +291,9 @@ fn format_caught_error(err: rquickjs::CaughtError<'_>) -> String {
                 format!("{val:?}")
             }
         }
+        // QuickJS throws null when it cannot allocate the out-of-memory error
+        // itself. A script throwing null literally is reported the same way.
+        rquickjs::CaughtError::Value(val) if val.is_null() => "out of memory".to_string(),
         rquickjs::CaughtError::Value(val) => format!("Thrown value: {val:?}"),
         rquickjs::CaughtError::Error(e) => format!("{e}"),
     }

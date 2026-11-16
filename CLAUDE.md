@@ -44,10 +44,12 @@ BEAM Process
   │
   └─ eval/3 ──► NIF sends EvalWithCallbacks, returns {:ok, nil}
        │         Worker installs dispatch + wrappers, evals
-       ├─ receive {:quicksand_callback, id, name, args} ──► call Elixir fun
+       ├─ receive {:quicksand_callback, tag, id, name, args} ──► call Elixir fun
        │    └─► NIF respond_callback ──► CallbackRegistry channel ──► Worker resumes
-       └─ receive {:quicksand_result, result} ──► return
+       └─ receive {:quicksand_result, tag, result} ──► return
 ```
+
+Each eval/3 call passes a unique `tag` that the worker puts in every message, so a late result from a timed-out call is never taken for the next call's. On timeout, `interrupt/2` marks the tag abandoned and the worker drops that call's result instead of sending it.
 
 ### Callback Mechanism
 

@@ -9,6 +9,7 @@ use std::time::Duration;
 pub struct CallbackRegistry {
     pending: Mutex<HashMap<u64, mpsc::Sender<CallbackResult>>>,
     next_id: AtomicU64,
+    abandoned_tag: AtomicU64,
 }
 
 impl CallbackRegistry {
@@ -16,7 +17,16 @@ impl CallbackRegistry {
         Self {
             pending: Mutex::new(HashMap::new()),
             next_id: AtomicU64::new(1),
+            abandoned_tag: AtomicU64::new(0),
         }
+    }
+
+    pub fn abandon(&self, tag: u64) {
+        self.abandoned_tag.store(tag, Ordering::Relaxed);
+    }
+
+    pub fn is_abandoned(&self, tag: u64) -> bool {
+        self.abandoned_tag.load(Ordering::Relaxed) == tag
     }
 
     pub fn register(&self) -> (u64, mpsc::Receiver<CallbackResult>) {

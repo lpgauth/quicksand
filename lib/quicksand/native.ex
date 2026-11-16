@@ -23,7 +23,7 @@ defmodule Quicksand.Native do
   def eval_sync(_resource, _code),
     do: :erlang.nif_error(:nif_not_loaded)
 
-  def eval_with_callbacks(_resource, _code, _fn_names),
+  def eval_with_callbacks(_resource, _code, _fn_names, _tag),
     do: :erlang.nif_error(:nif_not_loaded)
 
   def respond_callback(_resource, _callback_id, _result),
@@ -35,7 +35,7 @@ defmodule Quicksand.Native do
   def is_alive(_resource),
     do: :erlang.nif_error(:nif_not_loaded)
 
-  def interrupt(_resource),
+  def interrupt(_resource, _tag),
     do: :erlang.nif_error(:nif_not_loaded)
 
   def stop_runtime(_resource),
