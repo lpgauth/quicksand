@@ -29,7 +29,38 @@ defmodule QuicksandTest do
       {:ok, rt} = Quicksand.start()
       Quicksand.stop(rt)
       callbacks = %{"f" => fn [] -> {:ok, nil} end}
-      assert {:error, "dead_runtime"} = Quicksand.eval(rt, "f()", callbacks)
+
+      {elapsed, result} = :timer.tc(fn -> Quicksand.eval(rt, "f()", callbacks) end, :millisecond)
+      assert {:error, "dead_runtime"} = result
+      assert elapsed < 100
+    end
+
+    test "stop interrupts an eval running in another process" do
+      {:ok, rt} = Quicksand.start(timeout: 5_000)
+      task = Task.async(fn -> Quicksand.eval(rt, "while(true) {}") end)
+      Process.sleep(50)
+      assert :ok = Quicksand.stop(rt)
+      assert {:error, "dead_runtime"} = Task.await(task, 1_000)
+    end
+
+    test "start rejects unknown options" do
+      assert_raise ArgumentError, ~r/unknown keys \[:timout\]/, fn ->
+        Quicksand.start(timout: 1_000)
+      end
+    end
+
+    test "start rejects limits that are not positive or too large" do
+      for opts <- [
+            [timeout: 0],
+            [timeout: -1],
+            [timeout: "1000"],
+            [timeout: 4_294_967_296],
+            [memory_limit: 0],
+            [max_stack_size: 0],
+            [max_stack_size: 16 * 1024 * 1024 + 1]
+          ] do
+        assert_raise ArgumentError, fn -> Quicksand.start(opts) end
+      end
     end
 
     test "alive? returns true for running runtime" do
@@ -134,6 +165,90 @@ defmodule QuicksandTest do
     test "global state persists", %{rt: rt} do
       assert {:ok, 42} = Quicksand.eval(rt, "globalThis.x = 42")
       assert {:ok, 42} = Quicksand.eval(rt, "x")
+    end
+  end
+
+  describe "eval/2 results" do
+    setup do
+      {:ok, rt} = Quicksand.start()
+      on_exit(fn -> Quicksand.stop(rt) end)
+      %{rt: rt}
+    end
+
+    test "thrown values that are not errors", %{rt: rt} do
+      assert {:error, "42"} = Quicksand.eval(rt, "throw 42")
+      assert {:error, "oops"} = Quicksand.eval(rt, "throw 'oops'")
+      assert {:error, ~s({"code":1})} = Quicksand.eval(rt, "throw {code: 1}")
+      assert {:error, "[1,2]"} = Quicksand.eval(rt, "throw [1, 2]")
+      assert {:error, "undefined"} = Quicksand.eval(rt, "throw undefined")
+      assert {:error, "true"} = Quicksand.eval(rt, "throw true")
+    end
+
+    test "errors without a string message", %{rt: rt} do
+      assert {:error, "42\n" <> _} =
+               Quicksand.eval(rt, "throw Object.assign(new Error('x'), {message: 42})")
+
+      assert {:error, "Error\n" <> _} = Quicksand.eval(rt, "throw new Error()")
+      assert {:error, "TypeError\n" <> _} = Quicksand.eval(rt, "throw new TypeError()")
+    end
+
+    test "returned promises are awaited", %{rt: rt} do
+      assert {:ok, 42} = Quicksand.eval(rt, "Promise.resolve(42)")
+      assert {:ok, 42} = Quicksand.eval(rt, "(async () => { await null; return 42 })()")
+      assert {:error, msg} = Quicksand.eval(rt, "Promise.reject(new Error('nope'))")
+      assert msg =~ "nope"
+      assert {:error, "Promise did not settle"} = Quicksand.eval(rt, "new Promise(() => {})")
+    end
+
+    test "jobs run before the result is converted", %{rt: rt} do
+      code = "const o = {}; Promise.resolve().then(() => { o.x = 1 }); o"
+      assert {:ok, %{"x" => 1}} = Quicksand.eval(rt, code)
+    end
+
+    test "BigInt becomes an integer", %{rt: rt} do
+      assert {:ok, 10} = Quicksand.eval(rt, "10n")
+      assert {:ok, -10} = Quicksand.eval(rt, "-10n")
+      assert {:ok, n} = Quicksand.eval(rt, "2n ** 100n")
+      assert n == Integer.pow(2, 100)
+    end
+
+    test "values with no plain-data form", %{rt: rt} do
+      assert {:ok, nil} = Quicksand.eval(rt, "Symbol('s')")
+      assert {:ok, %{}} = Quicksand.eval(rt, "new Date(0)")
+      assert {:ok, %{}} = Quicksand.eval(rt, "new Map([[1, 2]])")
+      assert {:ok, %{"0" => 7, "1" => 8}} = Quicksand.eval(rt, "new Uint8Array([7, 8])")
+      assert {:ok, %{"a" => 1}} = Quicksand.eval(rt, "({a: 1, [Symbol('s')]: 2})")
+    end
+
+    test "cyclic result fails", %{rt: rt} do
+      assert {:error, "Maximum nesting depth exceeded"} =
+               Quicksand.eval(rt, "var o = {}; o.self = o; o")
+    end
+
+    test "a getter that throws fails the result", %{rt: rt} do
+      assert {:error, msg} = Quicksand.eval(rt, "({get a() { throw new Error('getter') }, b: 1})")
+      assert msg =~ "getter"
+      assert {:ok, 1} = Quicksand.eval(rt, "1")
+    end
+
+    test "non-ASCII strings round-trip", %{rt: rt} do
+      assert {:ok, "héllo 世界 😀"} = Quicksand.eval(rt, "'héllo 世界 😀'")
+      assert {:ok, 2} = Quicksand.eval(rt, "'😀'.length")
+      assert {:ok, %{"ключ" => "😀"}} = Quicksand.eval(rt, "({'ключ': '😀'})")
+    end
+
+    test "lone surrogates become U+FFFD", %{rt: rt} do
+      assert {:ok, "a\uFFFDb"} = Quicksand.eval(rt, "'a\\uD800b'")
+      assert {:ok, "\uFFFD"} = Quicksand.eval(rt, "'😀'.slice(0, 1)")
+      assert {:ok, %{"\uFFFD" => 1}} = Quicksand.eval(rt, "({'\\uDC00': 1})")
+    end
+
+    test "NUL bytes in source", %{rt: rt} do
+      assert {:ok, 3} = Quicksand.eval(rt, "'a" <> <<0>> <> "b'.length")
+    end
+
+    test "source that is not UTF-8", %{rt: rt} do
+      assert {:error, "JavaScript source must be valid UTF-8"} = Quicksand.eval(rt, <<0xFF>>)
     end
   end
 
@@ -290,6 +405,194 @@ defmodule QuicksandTest do
       """
 
       assert {:ok, "nope"} = Quicksand.eval(rt, code, callbacks)
+    end
+  end
+
+  describe "eval/3 callback edge cases" do
+    setup do
+      {:ok, rt} = Quicksand.start()
+      on_exit(fn -> Quicksand.stop(rt) end)
+      %{rt: rt}
+    end
+
+    test "callback errors are Error objects", %{rt: rt} do
+      callbacks = %{
+        "risky" => fn [n] ->
+          if n > 0, do: {:ok, n * 2}, else: {:error, "must be positive"}
+        end
+      }
+
+      assert {:ok, "must be positive"} =
+               Quicksand.eval(rt, "try { risky(-1); } catch(e) { e.message; }", callbacks)
+
+      assert {:ok, true} =
+               Quicksand.eval(rt, "try { risky(-1); } catch(e) { e instanceof Error }", callbacks)
+    end
+
+    test "callback names may be atoms", %{rt: rt} do
+      assert {:ok, 4} = Quicksand.eval(rt, "double(2)", %{double: fn [n] -> {:ok, n * 2} end})
+    end
+
+    test "callback names that are not strings or atoms raise", %{rt: rt} do
+      assert_raise ArgumentError, ~r/callback names must be strings or atoms/, fn ->
+        Quicksand.eval(rt, "1", %{1 => fn [] -> {:ok, 1} end})
+      end
+    end
+
+    test "error reasons that are not strings", %{rt: rt} do
+      assert {:error, msg} =
+               Quicksand.eval(rt, "f()", %{"f" => fn [] -> {:error, :not_found} end})
+
+      assert msg =~ "not_found"
+
+      assert {:error, msg} = Quicksand.eval(rt, "f()", %{"f" => fn [] -> {:error, {:bad, 1}} end})
+      assert msg =~ "{:bad, 1}"
+    end
+
+    test "callback throws and exits become JS errors", %{rt: rt} do
+      callbacks = %{
+        "t" => fn [] -> throw(:boom) end,
+        "e" => fn [] -> exit(:boom) end
+      }
+
+      assert {:error, msg} = Quicksand.eval(rt, "t()", callbacks)
+      assert msg =~ "Callback 't' threw: :boom"
+      assert {:error, msg} = Quicksand.eval(rt, "e()", callbacks)
+      assert msg =~ "Callback 'e' exited: :boom"
+      assert {:ok, "caught"} = Quicksand.eval(rt, "try { t() } catch (e) { 'caught' }", callbacks)
+
+      assert {:ok, 1} = Quicksand.eval(rt, "1")
+      refute_received {:quicksand_result, _, _}
+    end
+
+    test "callback results that cannot be converted", %{rt: rt} do
+      for {value, expected} <- [
+            {%{[1] => 2}, "Map keys must be strings, atoms, or integers"},
+            {%{1.5 => 2}, "Map keys must be strings, atoms, or integers"},
+            {{1, 2}, "Unsupported Elixir term type"},
+            {self(), "Unsupported Elixir term type"}
+          ] do
+        assert {:error, msg} = Quicksand.eval(rt, "f()", %{"f" => fn [] -> {:ok, value} end})
+        assert msg =~ expected
+      end
+    end
+
+    test "callback arguments that cannot be converted", %{rt: rt} do
+      test = self()
+
+      callbacks = %{
+        "f" => fn _ ->
+          send(test, :called)
+          {:ok, nil}
+        end
+      }
+
+      assert {:error, msg} = Quicksand.eval(rt, "const o = {}; o.o = o; f(o)", callbacks)
+      assert msg =~ "Failed to convert arguments for 'f'"
+      refute_received :called
+    end
+
+    test "bignum callback results become BigInt", %{rt: rt} do
+      callbacks = %{"big" => fn [] -> {:ok, Integer.pow(2, 70)} end}
+      assert {:ok, "bigint"} = Quicksand.eval(rt, "typeof big()", callbacks)
+      assert {:ok, n} = Quicksand.eval(rt, "big() + 1n", callbacks)
+      assert n == Integer.pow(2, 70) + 1
+    end
+
+    test "callbacks restore the globals they shadow", %{rt: rt} do
+      assert {:ok, nil} = Quicksand.eval(rt, "globalThis.helper = () => 'mine'; null")
+      noop = fn _ -> {:ok, nil} end
+      callbacks = %{"JSON" => noop, "helper" => noop, "toString" => noop, "fresh" => noop}
+
+      assert {:ok, nil} = Quicksand.eval(rt, "JSON(); helper(); toString(); fresh()", callbacks)
+
+      assert {:ok, "[1]"} = Quicksand.eval(rt, "JSON.stringify([1])")
+      assert {:ok, "mine"} = Quicksand.eval(rt, "helper()")
+      assert {:ok, false} = Quicksand.eval(rt, "Object.hasOwn(globalThis, 'toString')")
+      assert {:ok, "undefined"} = Quicksand.eval(rt, "typeof fresh")
+    end
+
+    test "a callback named __proto__ leaves the global prototype alone", %{rt: rt} do
+      same_prototype = "Object.getPrototypeOf(globalThis) === Object.prototype"
+      assert {:ok, true} = Quicksand.eval(rt, same_prototype)
+      assert {:ok, 7} = Quicksand.eval(rt, "__proto__()", %{"__proto__" => fn [] -> {:ok, 7} end})
+      assert {:ok, true} = Quicksand.eval(rt, same_prototype)
+    end
+
+    test "reserved and invalid callback names raise", %{rt: rt} do
+      noop = fn _ -> {:ok, nil} end
+
+      assert_raise ArgumentError, ~r/reserved/, fn ->
+        Quicksand.eval(rt, "1", %{"__quicksand_dispatch" => noop})
+      end
+
+      assert_raise ArgumentError, ~r/valid UTF-8/, fn ->
+        Quicksand.eval(rt, "1", %{<<0xFF>> => noop})
+      end
+    end
+
+    test "a __proto__ key in a callback result is an own property", %{rt: rt} do
+      callbacks = %{"f" => fn [] -> {:ok, %{"__proto__" => %{"polluted" => 1}}} end}
+      code = "const r = f(); [Object.keys(r), Object.getPrototypeOf(r) === Object.prototype]"
+      assert {:ok, [["__proto__"], true]} = Quicksand.eval(rt, code, callbacks)
+
+      assert {:ok, %{"__proto__" => %{"polluted" => 1}}} = Quicksand.eval(rt, "f()", callbacks)
+    end
+
+    test "errors raised inside a callback body keep their own message", %{rt: rt} do
+      only_atoms = fn atom when is_atom(atom) -> atom end
+      unary = fn x -> x end
+
+      callbacks = %{
+        "clause" => fn [x] -> {:ok, only_atoms.(x)} end,
+        "arity" => fn [x] -> {:ok, apply(unary, [x, x])} end
+      }
+
+      assert {:error, msg} = Quicksand.eval(rt, "clause(1)", callbacks)
+      assert msg =~ "no function clause matching"
+      refute msg =~ "Callback 'clause'"
+
+      assert {:error, msg} = Quicksand.eval(rt, "arity(1)", callbacks)
+      assert msg =~ "with arity 1 called with 2 arguments"
+      refute msg =~ "must accept a single argument"
+    end
+
+    test "a callback cannot eval on its own runtime", %{rt: rt} do
+      {:ok, other} = Quicksand.start()
+
+      callbacks = %{
+        "same" => fn [] -> {:ok, inspect(Quicksand.eval(rt, "1"))} end,
+        "other" => fn [] -> {:ok, inspect(Quicksand.eval(other, "2"))} end
+      }
+
+      {elapsed, result} =
+        :timer.tc(fn -> Quicksand.eval(rt, "same()", callbacks) end, :millisecond)
+
+      assert {:ok, ~s({:error, "Cannot eval on a runtime from inside one of its own callbacks"})} =
+               result
+
+      assert elapsed < 1_000
+      assert {:ok, "{:ok, 2}"} = Quicksand.eval(rt, "other()", callbacks)
+      Quicksand.stop(other)
+    end
+
+    test "callbacks can be used from async code", %{rt: rt} do
+      callbacks = %{"double" => fn [n] -> {:ok, n * 2} end}
+      code = "(async () => (await Promise.resolve(double(2))) + 1)()"
+      assert {:ok, 5} = Quicksand.eval(rt, code, callbacks)
+    end
+
+    test "concurrent callers on one runtime get their own results", %{rt: rt} do
+      callbacks = %{"times_ten" => fn [n] -> {:ok, n * 10} end}
+
+      results =
+        1..20
+        |> Enum.map(fn i ->
+          Task.async(fn -> Quicksand.eval(rt, "times_ten(#{i})", callbacks) end)
+        end)
+        |> Task.await_many(5_000)
+
+      assert results == Enum.map(1..20, &{:ok, &1 * 10})
     end
   end
 
@@ -457,6 +760,115 @@ defmodule QuicksandTest do
     end
   end
 
+  describe "limits on untrusted code" do
+    test "eval with callbacks times out on total time, not time between callbacks" do
+      {:ok, rt} = Quicksand.start(timeout: 200)
+      callbacks = %{"noop" => fn [] -> {:ok, nil} end}
+
+      for code <- [
+            "const end = Date.now() + 2000; while (Date.now() < end) noop(); 'done'",
+            "while (true) { try { noop() } catch (e) {} }"
+          ] do
+        {elapsed, result} = :timer.tc(fn -> Quicksand.eval(rt, code, callbacks) end, :millisecond)
+        assert {:error, "timeout"} = result
+        assert elapsed < 1_000
+      end
+
+      Quicksand.stop(rt)
+    end
+
+    test "a caller that dies does not leave its eval running" do
+      {:ok, rt} = Quicksand.start(timeout: 300)
+      test = self()
+
+      callbacks = %{
+        "block" => fn [] ->
+          send(test, :blocked)
+          Process.sleep(:infinity)
+        end
+      }
+
+      caller =
+        spawn(fn ->
+          Quicksand.eval(rt, "try { block() } catch (e) {} while (true) {}", callbacks)
+        end)
+
+      assert_receive :blocked, 1_000
+      Process.exit(caller, :kill)
+      Process.sleep(400)
+      assert {:ok, 1} = Quicksand.eval(rt, "1")
+      Quicksand.stop(rt)
+    end
+
+    test "late results of several abandoned evals are dropped" do
+      {:ok, rt} = Quicksand.start(timeout: 50)
+      # Parsing is not interruptible, so the worker misses both deadlines.
+      code = "[" <> Enum.map_join(1..2_000_000, ",", &Integer.to_string/1) <> "].length"
+      test = self()
+
+      for _ <- 1..2 do
+        spawn(fn ->
+          result = Quicksand.eval(rt, code)
+          Process.sleep(2_000)
+          {:messages, messages} = Process.info(self(), :messages)
+          send(test, {result, messages})
+        end)
+      end
+
+      for _ <- 1..2 do
+        assert_receive {{:error, "timeout"}, []}, 10_000
+      end
+
+      Quicksand.stop(rt)
+    end
+
+    test "cyclic garbage is collected under small memory limits" do
+      {:ok, rt} = Quicksand.start(memory_limit: 1024 * 1024)
+      code = "for (let i = 0; i < 200000; i++) { const a = {}; a.self = a } 'done'"
+      assert {:ok, "done"} = Quicksand.eval(rt, code)
+      Quicksand.stop(rt)
+    end
+
+    test "results count toward the memory limit" do
+      {:ok, rt} = Quicksand.start(memory_limit: 1024 * 1024)
+      assert {:error, "out of memory"} = Quicksand.eval(rt, "var a = []; a.length = 5e6; a")
+      assert {:ok, 1} = Quicksand.eval(rt, "1")
+      Quicksand.stop(rt)
+    end
+
+    test "converting a result stops at the timeout" do
+      {:ok, rt} = Quicksand.start(timeout: 100)
+      code = "let o = 1; for (let i = 0; i < 40; i++) o = [o, o]; o"
+
+      {elapsed, result} = :timer.tc(fn -> Quicksand.eval(rt, code) end, :millisecond)
+      assert {:error, _} = result
+      assert elapsed < 1_000
+      assert {:ok, 1} = Quicksand.eval(rt, "1")
+      Quicksand.stop(rt)
+    end
+
+    test "deep recursion at the largest stack limit does not crash the VM" do
+      {:ok, rt} = Quicksand.start(max_stack_size: 16 * 1024 * 1024)
+      code = "function f(n) { return n === 0 ? 0 : 1 + f(n - 1) } f(1e7)"
+      assert {:error, msg} = Quicksand.eval(rt, code)
+      assert msg =~ "Maximum call stack size exceeded"
+      Quicksand.stop(rt)
+    end
+
+    test "running evals do not hold dirty I/O schedulers" do
+      count = :erlang.system_info(:dirty_io_schedulers) + 2
+      runtimes = for _ <- 1..count, do: elem(Quicksand.start(timeout: 1_000), 1)
+      tasks = for rt <- runtimes, do: Task.async(fn -> Quicksand.eval(rt, "while(true) {}") end)
+      Process.sleep(100)
+
+      {elapsed, {:ok, _}} = :timer.tc(fn -> File.read(__ENV__.file) end, :millisecond)
+      assert elapsed < 500
+
+      assert Enum.all?(Task.await_many(tasks, 5_000), &(&1 == {:error, "timeout"}))
+      Enum.each(runtimes, &Quicksand.stop/1)
+    end
+  end
+
   describe "isolation" do
     test "separate runtimes are isolated" do
       {:ok, rt1} = Quicksand.start()
@@ -467,30 +879,6 @@ defmodule QuicksandTest do
 
       Quicksand.stop(rt1)
       Quicksand.stop(rt2)
-    end
-  end
-
-  describe "protocol atoms" do
-    setup do
-      {:ok, rt} = Quicksand.start()
-      on_exit(fn -> Quicksand.stop(rt) end)
-      %{rt: rt}
-    end
-
-    test "quicksand_callback atom in callback messages", %{rt: rt} do
-      callbacks = %{"ping" => fn [] -> {:ok, "pong"} end}
-      assert {:ok, "pong"} = Quicksand.eval(rt, "ping()", callbacks)
-    end
-
-    test "quicksand_result atom with ok", %{rt: rt} do
-      callbacks = %{"id" => fn [x] -> {:ok, x} end}
-      assert {:ok, 42} = Quicksand.eval(rt, "id(42)", callbacks)
-    end
-
-    test "quicksand_result atom with error", %{rt: rt} do
-      callbacks = %{"fail" => fn [] -> {:error, "nope"} end}
-      assert {:error, msg} = Quicksand.eval(rt, "fail()", callbacks)
-      assert msg =~ "nope"
     end
   end
 
@@ -516,8 +904,8 @@ defmodule QuicksandTest do
         constant(nil),
         boolean(),
         integer(-1_000_000..1_000_000),
-        float(min: -1.0e6, max: 1.0e6),
-        string(:alphanumeric, max_length: 50)
+        float(),
+        string(:printable, max_length: 50)
       ])
     end
 

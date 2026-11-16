@@ -1,3 +1,5 @@
+//! Atoms in the messages and replies sent to Elixir.
+
 rustler::atoms! {
     ok,
     error,

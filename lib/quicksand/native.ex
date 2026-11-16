@@ -11,8 +11,10 @@ defmodule Quicksand.Native do
     targets: ~w(
       aarch64-apple-darwin
       aarch64-unknown-linux-gnu
+      aarch64-unknown-linux-musl
       x86_64-apple-darwin
       x86_64-unknown-linux-gnu
+      x86_64-unknown-linux-musl
     ),
     nif_versions: ["2.15"],
     version: version
@@ -20,22 +22,16 @@ defmodule Quicksand.Native do
   def start_runtime(_ref, _timeout_ms, _memory_limit, _max_stack_size),
     do: :erlang.nif_error(:nif_not_loaded)
 
-  def eval_sync(_resource, _code),
-    do: :erlang.nif_error(:nif_not_loaded)
-
-  def eval_with_callbacks(_resource, _code, _fn_names, _tag),
+  def eval(_resource, _code, _callback_names, _tag),
     do: :erlang.nif_error(:nif_not_loaded)
 
   def respond_callback(_resource, _callback_id, _result),
     do: :erlang.nif_error(:nif_not_loaded)
 
-  def get_timeout(_resource),
+  def abandon(_resource, _tag),
     do: :erlang.nif_error(:nif_not_loaded)
 
   def is_alive(_resource),
-    do: :erlang.nif_error(:nif_not_loaded)
-
-  def interrupt(_resource, _tag),
     do: :erlang.nif_error(:nif_not_loaded)
 
   def stop_runtime(_resource),

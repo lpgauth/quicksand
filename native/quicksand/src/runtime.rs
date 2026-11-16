@@ -1,108 +1,161 @@
-use crate::convert::CallbackResult;
-use crate::worker;
-use rustler::{Encoder, LocalPid, OwnedEnv};
+//! The `Runtime` resource handed to Elixir and the registry of pending callbacks.
+
 use std::collections::HashMap;
+use std::mem;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::mpsc::{self, Receiver, SendError, Sender};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
+use rustler::{Encoder, LocalPid, OwnedEnv, Resource};
+
+use crate::convert::CallbackReply;
+use crate::interrupt::Interrupt;
+use crate::worker::Message;
+
+/// Pending callback replies and queued evals, shared by NIF calls and the
+/// worker thread.
+#[derive(Default)]
 pub struct CallbackRegistry {
-    pending: Mutex<HashMap<u64, mpsc::Sender<CallbackResult>>>,
+    pending: Mutex<HashMap<u64, Sender<CallbackReply>>>,
     next_id: AtomicU64,
-    abandoned_tag: AtomicU64,
+    // Tags of queued and running evals, mapped to whether their caller
+    // stopped waiting.
+    evals: Mutex<HashMap<u64, bool>>,
 }
 
 impl CallbackRegistry {
-    pub fn new() -> Self {
-        Self {
-            pending: Mutex::new(HashMap::new()),
-            next_id: AtomicU64::new(1),
-            abandoned_tag: AtomicU64::new(0),
-        }
-    }
-
-    pub fn abandon(&self, tag: u64) {
-        self.abandoned_tag.store(tag, Ordering::Relaxed);
-    }
-
-    pub fn is_abandoned(&self, tag: u64) -> bool {
-        self.abandoned_tag.load(Ordering::Relaxed) == tag
-    }
-
-    pub fn register(&self) -> (u64, mpsc::Receiver<CallbackResult>) {
+    #[must_use]
+    pub fn register(&self) -> (u64, Receiver<CallbackReply>) {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = mpsc::channel();
-        self.pending
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(id, tx);
+        self.pending().insert(id, tx);
         (id, rx)
     }
 
-    pub fn respond(&self, id: u64, result: CallbackResult) -> bool {
-        if let Some(tx) = self
-            .pending
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(&id)
-        {
-            tx.send(result).is_ok()
-        } else {
-            false
+    pub fn respond(&self, id: u64, reply: CallbackReply) {
+        let sender = self.pending().remove(&id);
+        if let Some(sender) = sender {
+            let _ = sender.send(reply);
+        }
+    }
+
+    /// Fails every pending callback with `reason`, waking the worker.
+    pub fn cancel_all(&self, reason: &str) {
+        let pending = mem::take(&mut *self.pending());
+        for sender in pending.into_values() {
+            let _ = sender.send(Err(reason.to_string()));
         }
     }
 
     pub fn clear(&self) {
+        self.pending().clear();
+    }
+
+    pub fn track(&self, tag: u64) {
+        self.evals().insert(tag, false);
+    }
+
+    /// Marks the eval tagged `tag` as one its caller stopped waiting for, so
+    /// the worker drops its result. Returns `false` if the result was already
+    /// sent.
+    #[must_use]
+    pub fn abandon(&self, tag: u64) -> bool {
+        match self.evals().get_mut(&tag) {
+            Some(abandoned) => {
+                *abandoned = true;
+                true
+            }
+            None => false,
+        }
+    }
+
+    #[must_use]
+    pub fn is_abandoned(&self, tag: u64) -> bool {
+        self.evals().get(&tag).copied().unwrap_or(true)
+    }
+
+    /// Forgets the eval tagged `tag`. Returns whether its result should still
+    /// be sent.
+    #[must_use]
+    pub fn finish(&self, tag: u64) -> bool {
+        self.evals().remove(&tag) == Some(false)
+    }
+
+    fn pending(&self) -> MutexGuard<'_, HashMap<u64, Sender<CallbackReply>>> {
         self.pending
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clear();
+            .expect("nothing panics while holding the callback registry lock")
+    }
+
+    fn evals(&self) -> MutexGuard<'_, HashMap<u64, bool>> {
+        self.evals
+            .lock()
+            .expect("nothing panics while holding the eval registry lock")
     }
 }
 
+/// The resource behind a `Quicksand` runtime reference.
 pub struct Runtime {
-    sender: mpsc::Sender<worker::Message>,
-    pub callbacks: Arc<CallbackRegistry>,
-    pub interrupt: Arc<AtomicBool>,
+    sender: Sender<Message>,
+    pub registry: Arc<CallbackRegistry>,
+    pub interrupt: Arc<Interrupt>,
+    // Shared with the worker thread, which clears it when it exits.
     pub alive: Arc<AtomicBool>,
     pub timeout: Duration,
 }
 
 impl Runtime {
     pub fn new(
-        sender: mpsc::Sender<worker::Message>,
-        interrupt: Arc<AtomicBool>,
+        sender: Sender<Message>,
+        registry: Arc<CallbackRegistry>,
+        interrupt: Arc<Interrupt>,
+        alive: Arc<AtomicBool>,
         timeout: Duration,
     ) -> Self {
         Self {
             sender,
-            callbacks: Arc::new(CallbackRegistry::new()),
+            registry,
             interrupt,
-            alive: Arc::new(AtomicBool::new(true)),
+            alive,
             timeout,
         }
     }
 
-    pub fn send(&self, msg: worker::Message) -> Result<(), mpsc::SendError<worker::Message>> {
-        self.sender.send(msg)
+    #[must_use]
+    pub fn is_alive(&self) -> bool {
+        self.alive.load(Ordering::Relaxed)
+    }
+
+    pub fn send(&self, message: Message) -> Result<(), SendError<Message>> {
+        self.sender.send(message)
+    }
+
+    /// Stops the worker, interrupting any running eval. Returns a receiver
+    /// that gets a message once the worker has stopped, or `None` if it
+    /// already had.
+    pub fn stop(&self) -> Option<Receiver<()>> {
+        self.alive.store(false, Ordering::Relaxed);
+        self.interrupt.stop();
+        self.registry.cancel_all("Runtime stopped");
+        let (tx, rx) = mpsc::channel();
+        self.sender.send(Message::Stop { reply: tx }).ok()?;
+        Some(rx)
     }
 }
 
 #[rustler::resource_impl]
-impl rustler::Resource for Runtime {}
+impl Resource for Runtime {}
 
 impl Drop for Runtime {
     fn drop(&mut self) {
-        self.alive.store(false, Ordering::Relaxed);
-        self.interrupt.store(true, Ordering::Relaxed);
-        let (tx, _rx) = mpsc::channel();
-        let _ = self.sender.send(worker::Message::Stop(tx));
+        let _ = self.stop();
     }
 }
 
-pub fn send_to_pid<T>(pid: &LocalPid, data: T) -> bool
-where
-    T: Encoder,
-{
-    OwnedEnv::new().send_and_clear(pid, |_env| data).is_ok()
+/// Sends `data` to `pid` from a thread that is not a BEAM scheduler. Returns
+/// whether the process was alive to receive it.
+#[must_use]
+pub fn send_to_pid<T: Encoder>(pid: LocalPid, data: T) -> bool {
+    OwnedEnv::new().send_and_clear(&pid, |_env| data).is_ok()
 }
