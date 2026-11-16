@@ -1,6 +1,8 @@
 %{
-  "libquicksand-v0.1.1-nif-2.15-aarch64-apple-darwin.so.tar.gz" => "sha256:61ad1675b2bb2e3d86498b325e870294bfb24a76545af7e3a6a1c341edd1aa04",
-  "libquicksand-v0.1.1-nif-2.15-aarch64-unknown-linux-gnu.so.tar.gz" => "sha256:eda0c65c4721e3607a5ff8b779b06bc2a2a9fa02695d9b2be114cb079c9a2110",
-  "libquicksand-v0.1.1-nif-2.15-x86_64-apple-darwin.so.tar.gz" => "sha256:e1a3fccd8f9911ce0e79d868df8fb16603b43593f12f7cada62ca1d083aa2190",
-  "libquicksand-v0.1.1-nif-2.15-x86_64-unknown-linux-gnu.so.tar.gz" => "sha256:1db70c306733950c8b2b7d3721a458a3996acca4773ee5acc60ed961a59a66b5",
+  "libquicksand-v0.2.0-nif-2.15-aarch64-apple-darwin.so.tar.gz" => "sha256:b10749c91709da862c1b945d238123fa03c82ab402d19fd21138d4e093a1ee8b",
+  "libquicksand-v0.2.0-nif-2.15-aarch64-unknown-linux-gnu.so.tar.gz" => "sha256:4f5feb9eee78f878bf4d118cb4fca939152282ae7e0d4e7fc93082e2894b7940",
+  "libquicksand-v0.2.0-nif-2.15-aarch64-unknown-linux-musl.so.tar.gz" => "sha256:d32aa8396b20a30fdc52781315d0f0e2ac390aa26147661793dd57e26ce6c17d",
+  "libquicksand-v0.2.0-nif-2.15-x86_64-apple-darwin.so.tar.gz" => "sha256:b71738fe69edd217bc0d2503de7442c52d45d9d9e2a28e3b69f4559df0f5fa4f",
+  "libquicksand-v0.2.0-nif-2.15-x86_64-unknown-linux-gnu.so.tar.gz" => "sha256:ace3eaecffcc4083260e202353032af7c1303a7e7d13e359f535474015e8074f",
+  "libquicksand-v0.2.0-nif-2.15-x86_64-unknown-linux-musl.so.tar.gz" => "sha256:e0e0c68a406a7a04ad688086a862da9dcf22de490655588dee88f781d1d146fd",
 }
