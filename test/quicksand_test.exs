@@ -293,6 +293,40 @@ defmodule QuicksandTest do
     end
   end
 
+  describe "pending jobs" do
+    test "timeout inside a job" do
+      for code <- [
+            "Promise.resolve().then(() => { while(true) {} }); 1",
+            "(async () => { await Promise.resolve(); while(true) {} })(); 1"
+          ] do
+        {:ok, rt} = Quicksand.start(timeout: 100)
+        assert {:error, "timeout"} = Quicksand.eval(rt, code)
+        assert {:ok, 42} = Quicksand.eval(rt, "21 * 2")
+        assert :ok = Quicksand.stop(rt)
+      end
+    end
+
+    test "timeout inside a job with callbacks" do
+      {:ok, rt} = Quicksand.start(timeout: 100)
+      callbacks = %{"noop" => fn [] -> {:ok, nil} end}
+      code = "Promise.resolve().then(() => { noop(); while(true) {} }); 1"
+      assert {:error, "timeout"} = Quicksand.eval(rt, code, callbacks)
+      assert {:ok, 42} = Quicksand.eval(rt, "21 * 2")
+      assert :ok = Quicksand.stop(rt)
+    end
+
+    test "out of memory inside a job" do
+      {:ok, rt} = Quicksand.start(memory_limit: 2 * 1024 * 1024)
+
+      code =
+        "Promise.resolve().then(() => { const arr = []; while(true) { arr.push('x'.repeat(1000)); } }); 1"
+
+      assert {:ok, 1} = Quicksand.eval(rt, code)
+      assert {:ok, 42} = Quicksand.eval(rt, "21 * 2")
+      assert :ok = Quicksand.stop(rt)
+    end
+  end
+
   describe "resource limits" do
     test "timeout" do
       {:ok, rt} = Quicksand.start(timeout: 100)
@@ -334,8 +368,12 @@ defmodule QuicksandTest do
       # Use a larger limit so QuickJS can GC and recover after OOM
       {:ok, rt} = Quicksand.start(memory_limit: 2 * 1024 * 1024)
 
+      # A top-level `const` would stay reachable as a global binding after the throw.
       assert {:error, _} =
-               Quicksand.eval(rt, "const arr = []; while(true) { arr.push('x'.repeat(1000)); }")
+               Quicksand.eval(
+                 rt,
+                 "(() => { const arr = []; while(true) { arr.push('x'.repeat(1000)); } })()"
+               )
 
       assert {:ok, 1} = Quicksand.eval(rt, "1")
       Quicksand.stop(rt)
