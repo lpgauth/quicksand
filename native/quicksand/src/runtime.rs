@@ -13,13 +13,15 @@ use crate::convert::CallbackReply;
 use crate::interrupt::Interrupt;
 use crate::worker::Message;
 
-/// Pending callback replies, shared by NIF calls and the worker thread.
+/// Pending callback replies and queued evals, shared by NIF calls and the
+/// worker thread.
 #[derive(Default)]
 pub struct CallbackRegistry {
     pending: Mutex<HashMap<u64, Sender<CallbackReply>>>,
     next_id: AtomicU64,
-    // Tags are positive, so the initial 0 matches no eval.
-    abandoned_tag: AtomicU64,
+    // Tags of queued and running evals, mapped to whether their caller
+    // stopped waiting.
+    evals: Mutex<HashMap<u64, bool>>,
 }
 
 impl CallbackRegistry {
@@ -50,21 +52,46 @@ impl CallbackRegistry {
         self.pending().clear();
     }
 
+    pub fn track(&self, tag: u64) {
+        self.evals().insert(tag, false);
+    }
+
     /// Marks the eval tagged `tag` as one its caller stopped waiting for, so
-    /// the worker drops its result instead of sending it.
-    pub fn abandon(&self, tag: u64) {
-        self.abandoned_tag.store(tag, Ordering::Relaxed);
+    /// the worker drops its result. Returns `false` if the result was already
+    /// sent.
+    #[must_use]
+    pub fn abandon(&self, tag: u64) -> bool {
+        match self.evals().get_mut(&tag) {
+            Some(abandoned) => {
+                *abandoned = true;
+                true
+            }
+            None => false,
+        }
     }
 
     #[must_use]
     pub fn is_abandoned(&self, tag: u64) -> bool {
-        self.abandoned_tag.load(Ordering::Relaxed) == tag
+        self.evals().get(&tag).copied().unwrap_or(true)
+    }
+
+    /// Forgets the eval tagged `tag`. Returns whether its result should still
+    /// be sent.
+    #[must_use]
+    pub fn finish(&self, tag: u64) -> bool {
+        self.evals().remove(&tag) == Some(false)
     }
 
     fn pending(&self) -> MutexGuard<'_, HashMap<u64, Sender<CallbackReply>>> {
         self.pending
             .lock()
             .expect("nothing panics while holding the callback registry lock")
+    }
+
+    fn evals(&self) -> MutexGuard<'_, HashMap<u64, bool>> {
+        self.evals
+            .lock()
+            .expect("nothing panics while holding the eval registry lock")
     }
 }
 

@@ -5,6 +5,7 @@ use std::sync::mpsc::{Receiver, Sender};
 use std::sync::Arc;
 use std::time::Instant;
 
+use rquickjs::object::Property;
 use rquickjs::{
     CatchResultExt, CaughtError, Context, Ctx, Exception, Function, Object, Persistent, Runtime,
     Value,
@@ -21,6 +22,9 @@ type EvalResult = Result<JsValue, String>;
 pub const DEAD_RUNTIME: &str = "dead_runtime";
 const TIMEOUT: &str = "timeout";
 
+// QuickJS collects cycles only once the heap passes this threshold, and never
+// when an allocation fails, so it has to start below the memory limit or
+// collectable garbage runs the eval out of memory.
 const GC_THRESHOLD: usize = 4 * 1024 * 1024;
 
 // QuickJS cannot discard queued jobs, so once an eval has to stop the
@@ -89,7 +93,7 @@ impl Worker {
             Runtime::new().map_err(|error| format!("Failed to create QuickJS runtime: {error}"))?;
         runtime.set_memory_limit(options.memory_limit);
         runtime.set_max_stack_size(options.max_stack_size);
-        runtime.set_gc_threshold(GC_THRESHOLD);
+        runtime.set_gc_threshold(GC_THRESHOLD.min(options.memory_limit / 2));
         let handler_interrupt = Arc::clone(&interrupt);
         runtime.set_interrupt_handler(Some(Box::new(move || handler_interrupt.is_due())));
 
@@ -161,7 +165,7 @@ impl Worker {
     }
 
     fn reply(&self, request: &EvalRequest, result: EvalResult) {
-        if !self.registry.is_abandoned(request.tag) {
+        if self.registry.finish(request.tag) {
             let message = (atoms::quicksand_result(), request.tag, result);
             let _ = runtime::send_to_pid(request.caller, message);
         }
@@ -261,9 +265,17 @@ impl Worker {
                 .call((name.as_str(),))
                 .catch(ctx)
                 .map_err(|error| format!("Failed to create wrapper for {name}: {error:?}"))?;
-            globals
-                .set(name.as_str(), wrapper)
-                .map_err(|error| format!("Failed to set wrapper for {name}: {error}"))?;
+            // Defined rather than assigned, so a name like `__proto__` becomes
+            // an own property instead of replacing the global's prototype.
+            let defined = if previous.is_undefined() {
+                let property = Property::from(wrapper).writable().configurable();
+                globals.prop(name.as_str(), property)
+            } else {
+                globals.prop(name.as_str(), wrapper)
+            };
+            defined
+                .catch(ctx)
+                .map_err(|error| format!("Failed to set wrapper for {name}: {error:?}"))?;
             shadowed.push(previous);
         }
 
@@ -287,7 +299,7 @@ impl Worker {
         Function::new(
             ctx.clone(),
             move |ctx: Ctx<'_>, name: String| -> rquickjs::Result<()> {
-                if interrupt.is_due() {
+                if interrupt.is_due() || registry.is_abandoned(tag) {
                     let message =
                         format!("Callback '{name}' called after the eval was interrupted");
                     return Err(Exception::throw_message(&ctx, &message));

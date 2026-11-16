@@ -8,6 +8,7 @@ use std::borrow::Cow;
 use std::mem;
 
 use rquickjs::function::This;
+use rquickjs::object::Property;
 use rquickjs::{Array, Coerced, Ctx, FromJs, Function, IntoAtom, Object, Value};
 use rustler::types::atom;
 use rustler::{BigInt, Encoder, Env, MapIterator, Term};
@@ -253,7 +254,10 @@ pub fn describe_thrown<'js>(ctx: &Ctx<'js>, value: Value<'js>) -> String {
     }
 
     if let Some(object) = value.as_object().filter(|_| value.is_error()) {
-        let message = string_property(ctx, object, "message");
+        let mut message = string_property(ctx, object, "message");
+        if message.is_empty() {
+            message = string_property(ctx, object, "name");
+        }
         let stack = string_property(ctx, object, "stack");
         return if stack.is_empty() {
             message
@@ -285,12 +289,24 @@ pub fn describe_thrown<'js>(ctx: &Ctx<'js>, value: Value<'js>) -> String {
     }
 }
 
+/// Reads `key` as a string, coercing non-string values the way `String()`
+/// does. Missing values and failures read as empty.
 fn string_property<'js>(ctx: &Ctx<'js>, object: &Object<'js>, key: &str) -> String {
-    match object.get::<_, Value>(key) {
-        Ok(value) => value
-            .as_string()
-            .and_then(|string| to_rust_string(ctx, string).ok())
-            .unwrap_or_default(),
+    let value = match object.get::<_, Value>(key) {
+        Ok(value) => value,
+        Err(_) => {
+            ctx.catch();
+            return String::new();
+        }
+    };
+    if value.is_undefined() || value.is_null() {
+        return String::new();
+    }
+    if let Some(string) = value.as_string() {
+        return to_rust_string(ctx, string).unwrap_or_default();
+    }
+    match Coerced::<String>::from_js(ctx, value) {
+        Ok(Coerced(string)) => string,
         Err(_) => {
             ctx.catch();
             String::new()
@@ -441,8 +457,11 @@ fn intermediate_to_js_at_depth<'js>(
                     _ => return Err("Map keys must be strings, atoms, or integers".to_string()),
                 };
                 let value = intermediate_to_js_at_depth(ctx, value, depth + 1)?;
+                // Defined rather than assigned, so a `__proto__` key becomes an
+                // own property (as with JSON.parse) instead of the prototype.
+                let property = Property::from(value).writable().enumerable().configurable();
                 object
-                    .set(key.as_ref(), value)
+                    .prop(key.as_ref(), property)
                     .map_err(|error| format!("Failed to set object property: {error}"))?;
             }
             Ok(object.into_value())

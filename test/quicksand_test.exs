@@ -184,6 +184,14 @@ defmodule QuicksandTest do
       assert {:error, "true"} = Quicksand.eval(rt, "throw true")
     end
 
+    test "errors without a string message", %{rt: rt} do
+      assert {:error, "42\n" <> _} =
+               Quicksand.eval(rt, "throw Object.assign(new Error('x'), {message: 42})")
+
+      assert {:error, "Error\n" <> _} = Quicksand.eval(rt, "throw new Error()")
+      assert {:error, "TypeError\n" <> _} = Quicksand.eval(rt, "throw new TypeError()")
+    end
+
     test "returned promises are awaited", %{rt: rt} do
       assert {:ok, 42} = Quicksand.eval(rt, "Promise.resolve(42)")
       assert {:ok, 42} = Quicksand.eval(rt, "(async () => { await null; return 42 })()")
@@ -504,6 +512,70 @@ defmodule QuicksandTest do
       assert {:ok, "undefined"} = Quicksand.eval(rt, "typeof fresh")
     end
 
+    test "a callback named __proto__ leaves the global prototype alone", %{rt: rt} do
+      same_prototype = "Object.getPrototypeOf(globalThis) === Object.prototype"
+      assert {:ok, true} = Quicksand.eval(rt, same_prototype)
+      assert {:ok, 7} = Quicksand.eval(rt, "__proto__()", %{"__proto__" => fn [] -> {:ok, 7} end})
+      assert {:ok, true} = Quicksand.eval(rt, same_prototype)
+    end
+
+    test "reserved and invalid callback names raise", %{rt: rt} do
+      noop = fn _ -> {:ok, nil} end
+
+      assert_raise ArgumentError, ~r/reserved/, fn ->
+        Quicksand.eval(rt, "1", %{"__quicksand_dispatch" => noop})
+      end
+
+      assert_raise ArgumentError, ~r/valid UTF-8/, fn ->
+        Quicksand.eval(rt, "1", %{<<0xFF>> => noop})
+      end
+    end
+
+    test "a __proto__ key in a callback result is an own property", %{rt: rt} do
+      callbacks = %{"f" => fn [] -> {:ok, %{"__proto__" => %{"polluted" => 1}}} end}
+      code = "const r = f(); [Object.keys(r), Object.getPrototypeOf(r) === Object.prototype]"
+      assert {:ok, [["__proto__"], true]} = Quicksand.eval(rt, code, callbacks)
+
+      assert {:ok, %{"__proto__" => %{"polluted" => 1}}} = Quicksand.eval(rt, "f()", callbacks)
+    end
+
+    test "errors raised inside a callback body keep their own message", %{rt: rt} do
+      only_atoms = fn atom when is_atom(atom) -> atom end
+      unary = fn x -> x end
+
+      callbacks = %{
+        "clause" => fn [x] -> {:ok, only_atoms.(x)} end,
+        "arity" => fn [x] -> {:ok, apply(unary, [x, x])} end
+      }
+
+      assert {:error, msg} = Quicksand.eval(rt, "clause(1)", callbacks)
+      assert msg =~ "no function clause matching"
+      refute msg =~ "Callback 'clause'"
+
+      assert {:error, msg} = Quicksand.eval(rt, "arity(1)", callbacks)
+      assert msg =~ "with arity 1 called with 2 arguments"
+      refute msg =~ "must accept a single argument"
+    end
+
+    test "a callback cannot eval on its own runtime", %{rt: rt} do
+      {:ok, other} = Quicksand.start()
+
+      callbacks = %{
+        "same" => fn [] -> {:ok, inspect(Quicksand.eval(rt, "1"))} end,
+        "other" => fn [] -> {:ok, inspect(Quicksand.eval(other, "2"))} end
+      }
+
+      {elapsed, result} =
+        :timer.tc(fn -> Quicksand.eval(rt, "same()", callbacks) end, :millisecond)
+
+      assert {:ok, ~s({:error, "Cannot eval on a runtime from inside one of its own callbacks"})} =
+               result
+
+      assert elapsed < 1_000
+      assert {:ok, "{:ok, 2}"} = Quicksand.eval(rt, "other()", callbacks)
+      Quicksand.stop(other)
+    end
+
     test "callbacks can be used from async code", %{rt: rt} do
       callbacks = %{"double" => fn [n] -> {:ok, n * 2} end}
       code = "(async () => (await Promise.resolve(double(2))) + 1)()"
@@ -725,6 +797,35 @@ defmodule QuicksandTest do
       Process.exit(caller, :kill)
       Process.sleep(400)
       assert {:ok, 1} = Quicksand.eval(rt, "1")
+      Quicksand.stop(rt)
+    end
+
+    test "late results of several abandoned evals are dropped" do
+      {:ok, rt} = Quicksand.start(timeout: 50)
+      # Parsing is not interruptible, so the worker misses both deadlines.
+      code = "[" <> Enum.map_join(1..2_000_000, ",", &Integer.to_string/1) <> "].length"
+      test = self()
+
+      for _ <- 1..2 do
+        spawn(fn ->
+          result = Quicksand.eval(rt, code)
+          Process.sleep(2_000)
+          {:messages, messages} = Process.info(self(), :messages)
+          send(test, {result, messages})
+        end)
+      end
+
+      for _ <- 1..2 do
+        assert_receive {{:error, "timeout"}, []}, 10_000
+      end
+
+      Quicksand.stop(rt)
+    end
+
+    test "cyclic garbage is collected under small memory limits" do
+      {:ok, rt} = Quicksand.start(memory_limit: 1024 * 1024)
+      code = "for (let i = 0; i < 200000; i++) { const a = {}; a.self = a } 'done'"
+      assert {:ok, "done"} = Quicksand.eval(rt, code)
       Quicksand.stop(rt)
     end
 

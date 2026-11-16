@@ -18,6 +18,11 @@ use crate::worker::{EvalRequest, Message, Worker, WorkerOptions, DEAD_RUNTIME};
 // rquickjs treats a larger `max_stack_size` as no limit at all.
 const MAX_STACK_SIZE: usize = 1 << 24;
 
+// How long `stop` waits for the worker to finish. A worker stuck in a long
+// parse still stops afterwards, but holding a dirty scheduler that long is not
+// worth it.
+const STOP_WAIT: Duration = Duration::from_secs(5);
+
 // QuickJS only enforces `max_stack_size` on JS frames. The native frames
 // around them (the worker loop, conversions, callbacks) need room too, and
 // without it deep recursion overflows the thread's stack and crashes the VM.
@@ -99,8 +104,9 @@ fn start_runtime(
 
 /// Queues `code` on the runtime and returns its timeout in milliseconds. The
 /// result arrives as `{:quicksand_result, tag, result}`, after any
-/// `{:quicksand_callback, tag, id, name, args}` requests.
-#[rustler::nif]
+/// `{:quicksand_callback, tag, id, name, args}` requests. Dirty so copying a
+/// large source never holds a normal scheduler.
+#[rustler::nif(schedule = "DirtyCpu")]
 fn eval(
     env: Env,
     resource: ResourceArc<Runtime>,
@@ -121,13 +127,16 @@ fn eval(
         tag,
         deadline: Instant::now().checked_add(resource.timeout),
     };
-    resource
-        .send(Message::Eval(request))
-        .map_err(|_| DEAD_RUNTIME.to_string())?;
+    resource.registry.track(tag);
+    if resource.send(Message::Eval(request)).is_err() {
+        let _ = resource.registry.finish(tag);
+        return Err(DEAD_RUNTIME.to_string());
+    }
     Ok(u64::try_from(resource.timeout.as_millis()).unwrap_or(u64::MAX))
 }
 
-#[rustler::nif]
+// Dirty so decoding a large reply never holds a normal scheduler.
+#[rustler::nif(schedule = "DirtyCpu")]
 fn respond_callback(resource: ResourceArc<Runtime>, callback_id: u64, result: Term) -> Atom {
     resource
         .registry
@@ -152,10 +161,10 @@ fn decode_callback_reply(term: Term) -> CallbackReply {
     }
 }
 
+/// Returns `false` if the eval's result was already sent.
 #[rustler::nif]
-fn abandon(resource: ResourceArc<Runtime>, tag: u64) -> Atom {
-    resource.registry.abandon(tag);
-    atoms::ok()
+fn abandon(resource: ResourceArc<Runtime>, tag: u64) -> bool {
+    resource.registry.abandon(tag)
 }
 
 #[rustler::nif]
@@ -166,7 +175,7 @@ fn is_alive(resource: ResourceArc<Runtime>) -> bool {
 #[rustler::nif(schedule = "DirtyIo")]
 fn stop_runtime(resource: ResourceArc<Runtime>) -> Atom {
     if let Some(stopped) = resource.stop() {
-        let _ = stopped.recv_timeout(resource.timeout);
+        let _ = stopped.recv_timeout(resource.timeout.min(STOP_WAIT));
     }
     atoms::ok()
 }

@@ -34,7 +34,7 @@ Quicksand is an Elixir NIF wrapping QuickJS-NG (via `rquickjs` crate) for sandbo
 
 ### Thread Model
 
-Each runtime spawns a dedicated OS thread running a QuickJS worker, with a stack sized from `max_stack_size`. NIF calls reach it over an `mpsc` channel and never block on JS execution, so no scheduler (dirty or not) is held while code runs.
+Each runtime spawns a dedicated OS thread running a QuickJS worker, with a stack sized from `max_stack_size`. NIF calls reach it over an `mpsc` channel and never wait for JS to run. `eval` and `respond_callback` run on dirty CPU schedulers only long enough to copy their input.
 
 ```
 BEAM Process
@@ -68,7 +68,7 @@ JS→Elixir is single-phase: `rquickjs::Value` → `JsValue` enum → Erlang `Te
 
 Each eval carries a deadline, set when the `eval` NIF queues it. The worker enforces it itself through `Interrupt` (`interrupt.rs`): the QuickJS interrupt handler, the job drain, result conversion and callback waits all stop once it passes, and the result becomes `"timeout"`. No other caller's timeout can interrupt an eval, and a caller that dies cannot leave its eval running past the deadline.
 
-The Elixir side waits until the same deadline. If it gives up first, `abandon/2` marks the tag and the worker drops that result instead of sending it.
+The Elixir side waits until the same deadline. If it gives up first, `abandon/2` marks the eval so the worker drops its result. If the worker already sent it, `abandon/2` returns `false` and the caller takes the result from its mailbox, so nothing is left behind.
 
 `stop` sets a separate flag that never clears: it interrupts the running eval, fails pending callbacks, and makes queued evals return `"dead_runtime"`.
 

@@ -27,6 +27,9 @@ defmodule Quicksand do
   # recursion overflows the worker's native stack and crashes the VM.
   @max_stack_size 16 * 1024 * 1024
 
+  # Runtimes whose callbacks are running in this process, innermost first.
+  @callback_runtimes :quicksand_callback_runtimes
+
   @type runtime :: reference()
   @type js_result :: {:ok, term()} | {:error, String.t()}
   @type callback :: (list() -> {:ok, term()} | {:error, term()})
@@ -92,10 +95,12 @@ defmodule Quicksand do
   @doc """
   Evaluate JavaScript code with pre-registered Elixir callbacks.
 
-  Callback names are strings or atoms. Each callback receives its
-  arguments as a list and must return `{:ok, value}` or
-  `{:error, reason}`. Errors, raises, throws and exits become JS
-  exceptions.
+  Callback names are strings or atoms; names starting with
+  `__quicksand_` are reserved. Each callback receives its arguments as
+  a list and must return `{:ok, value}` or `{:error, reason}`. Errors,
+  raises, throws and exits become JS exceptions. A callback cannot eval
+  on the runtime that is running it, since that runtime is busy waiting
+  for the callback.
 
       callbacks = %{
         "add" => fn [a, b] -> {:ok, a + b} end
@@ -107,6 +112,15 @@ defmodule Quicksand do
           js_result()
   def eval(runtime, code, callbacks) when is_binary(code) and is_map(callbacks) do
     callbacks = normalize_callbacks!(callbacks)
+
+    if runtime in Process.get(@callback_runtimes, []) do
+      {:error, "Cannot eval on a runtime from inside one of its own callbacks"}
+    else
+      queue_eval(runtime, code, callbacks)
+    end
+  end
+
+  defp queue_eval(runtime, code, callbacks) do
     tag = :erlang.unique_integer([:positive])
 
     case Quicksand.Native.eval(runtime, code, Map.keys(callbacks), tag) do
@@ -149,16 +163,26 @@ defmodule Quicksand do
   end
 
   defp normalize_callbacks!(callbacks) do
-    Map.new(callbacks, fn
-      {name, fun} when is_binary(name) ->
-        {name, fun}
+    Map.new(callbacks, fn {name, fun} -> {callback_name!(name), fun} end)
+  end
 
-      {name, fun} when is_atom(name) ->
-        {Atom.to_string(name), fun}
+  defp callback_name!(name) when is_atom(name), do: callback_name!(Atom.to_string(name))
 
-      {name, _fun} ->
-        raise ArgumentError, "callback names must be strings or atoms, got: #{inspect(name)}"
-    end)
+  defp callback_name!(name) when is_binary(name) do
+    cond do
+      not String.valid?(name) ->
+        raise ArgumentError, "callback names must be valid UTF-8, got: #{inspect(name)}"
+
+      String.starts_with?(name, "__quicksand_") ->
+        raise ArgumentError, "callback names starting with __quicksand_ are reserved"
+
+      true ->
+        name
+    end
+  end
+
+  defp callback_name!(name) do
+    raise ArgumentError, "callback names must be strings or atoms, got: #{inspect(name)}"
   end
 
   defp await_result(runtime, callbacks, tag, deadline) do
@@ -167,37 +191,83 @@ defmodule Quicksand do
         result
 
       {:quicksand_callback, ^tag, id, name, args} ->
-        reply = run_callback(callbacks, name, args)
+        reply = run_callback(runtime, callbacks, name, args)
         Quicksand.Native.respond_callback(runtime, id, reply)
         await_result(runtime, callbacks, tag, deadline)
     after
       max(deadline - System.monotonic_time(:millisecond), 0) ->
-        Quicksand.Native.abandon(runtime, tag)
-        {:error, "timeout"}
+        result =
+          if Quicksand.Native.abandon(runtime, tag) do
+            {:error, "timeout"}
+          else
+            # The worker sent the result just as the deadline passed.
+            receive do
+              {:quicksand_result, ^tag, result} -> result
+            after
+              1_000 -> {:error, "timeout"}
+            end
+          end
+
+        flush_callbacks(tag)
+        result
     end
   end
 
-  defp run_callback(callbacks, name, args) do
+  defp flush_callbacks(tag) do
+    receive do
+      {:quicksand_callback, ^tag, _id, _name, _args} -> flush_callbacks(tag)
+    after
+      0 -> :ok
+    end
+  end
+
+  defp run_callback(runtime, callbacks, name, args) do
     case Map.fetch(callbacks, name) do
-      {:ok, fun} -> invoke_callback(fun, name, args)
+      {:ok, fun} -> with_callback_runtime(runtime, fn -> invoke_callback(fun, name, args) end)
       :error -> {:error, "Unknown callback: #{name}"}
+    end
+  end
+
+  defp with_callback_runtime(runtime, fun) do
+    outer = Process.get(@callback_runtimes, [])
+    Process.put(@callback_runtimes, [runtime | outer])
+
+    try do
+      fun.()
+    after
+      Process.put(@callback_runtimes, outer)
     end
   end
 
   defp invoke_callback(fun, name, args) do
     fun.(args) |> normalize_reply()
   rescue
-    FunctionClauseError ->
-      {:error, "Callback '#{name}': no matching clause for #{length(args)} arg(s)"}
+    exception in FunctionClauseError ->
+      if raised_by?(exception, fun) do
+        {:error, "Callback '#{name}': no matching clause for #{length(args)} arg(s)"}
+      else
+        {:error, Exception.message(exception)}
+      end
 
-    BadArityError ->
-      {:error, "Callback '#{name}': function must accept a single argument (the args list)"}
+    exception in BadArityError ->
+      if exception.function == fun do
+        {:error, "Callback '#{name}': function must accept a single argument (the args list)"}
+      else
+        {:error, Exception.message(exception)}
+      end
 
     exception ->
       {:error, Exception.message(exception)}
   catch
     :throw, value -> {:error, "Callback '#{name}' threw: #{inspect(value)}"}
     :exit, reason -> {:error, "Callback '#{name}' exited: #{inspect(reason)}"}
+  end
+
+  defp raised_by?(%FunctionClauseError{} = exception, fun) do
+    info = Function.info(fun)
+
+    {exception.module, exception.function, exception.arity} ==
+      {info[:module], info[:name], info[:arity]}
   end
 
   defp normalize_reply({:ok, _} = reply), do: reply

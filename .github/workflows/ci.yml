@@ -43,7 +43,10 @@ jobs:
           - os: ubuntu-latest
             otp: "26"
             elixir: "1.17"
-          - os: macos-14
+          - os: ubuntu-latest
+            otp: "26"
+            elixir: "1.15"
+          - os: macos-15
             otp: "27"
             elixir: "1.18"
     steps:
@@ -58,6 +61,24 @@ jobs:
 
       - run: mix deps.get
       - run: mix compile --warnings-as-errors
+      - run: mix test
+
+  test-musl:
+    name: Test (musl / Alpine)
+    runs-on: ubuntu-latest
+    container: elixir:1.18-otp-27-alpine
+    steps:
+      - uses: actions/checkout@v6
+
+      - run: apk add --no-cache build-base curl git
+
+      - name: Install Rust
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - run: mix local.hex --force && mix local.rebar --force
+      - run: mix deps.get
       - run: mix test
 
   dialyzer:

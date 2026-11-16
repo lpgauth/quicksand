@@ -125,6 +125,8 @@ callbacks = %{
 
 A callback can share its name with an existing global, such as `JSON`. The global is shadowed for that eval only and restored afterwards.
 
+A runtime runs one eval at a time. Evals from other processes queue behind it, and their timeout includes the wait. A callback therefore cannot eval on the runtime that is running it; that call returns an error instead of waiting for itself.
+
 ### Lifecycle
 
 ```elixir
@@ -187,7 +189,7 @@ When `eval/3` is in callback mode, quicksand installs four `globalThis.__quicksa
 - `__quicksand_cb_args` — slot the wrapper writes per-call arguments into.
 - `__quicksand_cb_result` — slot Elixir writes the result into.
 
-Don't define these in your user JS — overwriting them silently breaks all Elixir callbacks in that runtime. The leading double-underscore is a convention signaling "implementation detail, don't touch", matching the same convention QuickJS-NG uses internally.
+Callback names starting with `__quicksand_` are rejected. Don't define these in your user JS — overwriting them silently breaks all Elixir callbacks in that runtime. The leading double-underscore is a convention signaling "implementation detail, don't touch", matching the same convention QuickJS-NG uses internally.
 
 ## Type Conversion
 

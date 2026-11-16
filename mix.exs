@@ -14,14 +14,13 @@ defmodule Quicksand.MixProject do
       package: package(),
       description: "Sandboxed JavaScript execution for Elixir via QuickJS-NG",
       source_url: @source_url,
-      homepage_url: @source_url
+      homepage_url: @source_url,
+      docs: docs()
     ]
   end
 
   def application do
-    [
-      extra_applications: [:logger]
-    ]
+    []
   end
 
   defp deps do
@@ -34,6 +33,14 @@ defmodule Quicksand.MixProject do
     ]
   end
 
+  defp docs do
+    [
+      main: "readme",
+      extras: ["README.md"],
+      source_ref: "v#{@version}"
+    ]
+  end
+
   defp package do
     [
       licenses: ["MIT"],
@@ -42,6 +49,7 @@ defmodule Quicksand.MixProject do
         lib
         native/quicksand/src
         native/quicksand/Cargo.toml
+        .cargo/config.toml
         Cargo.toml
         Cargo.lock
         Cross.toml
