@@ -1,6 +1,6 @@
 [package]
 name = "quicksand"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 
 [lib]
@@ -8,8 +8,8 @@ name = "quicksand"
 crate-type = ["cdylib"]
 
 [dependencies]
-rustler = { version = "0.37", default-features = false, features = ["big_integer", "derive", "nif_version_2_15"] }
-rquickjs = { version = "0.14", features = ["bindgen", "parallel"] }
+rustler = { version = "0.38", default-features = false, features = ["big_integer", "derive", "nif_version_2_15"] }
+rquickjs = { version = "0.14", features = ["parallel"] }
 
 # Google Rust style guide rules that clippy can check.
 [lints.clippy]

@@ -2,8 +2,3 @@
 passthrough = [
   "RUSTLER_NIF_VERSION"
 ]
-
-[build]
-pre-build = [
-  "apt-get update && apt-get install -y llvm-dev libclang-dev clang"
-]

@@ -15,7 +15,7 @@ Quicksand embeds the QuickJS-NG engine as a Rustler NIF, giving you in-process J
 ## Requirements
 
 - Elixir >= 1.15
-- Precompiled NIF binaries are provided for macOS (ARM/Intel) and Linux (x86/ARM)
+- Precompiled NIF binaries are provided for macOS (ARM/Intel) and Linux (x86/ARM, glibc and musl)
 - Rust toolchain only needed if building from source
 
 ## Installation

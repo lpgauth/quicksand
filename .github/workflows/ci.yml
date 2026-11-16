@@ -32,15 +32,20 @@ jobs:
       - run: cargo clippy -- -D warnings
 
   test:
-    name: Test (OTP ${{ matrix.otp }} / Elixir ${{ matrix.elixir }})
-    runs-on: ubuntu-latest
+    name: Test (OTP ${{ matrix.otp }} / Elixir ${{ matrix.elixir }} / ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
     strategy:
       matrix:
         include:
-          - otp: "27"
+          - os: ubuntu-latest
+            otp: "27"
             elixir: "1.18"
-          - otp: "26"
+          - os: ubuntu-latest
+            otp: "26"
             elixir: "1.17"
+          - os: macos-14
+            otp: "27"
+            elixir: "1.18"
     steps:
       - uses: actions/checkout@v6
 
@@ -54,3 +59,27 @@ jobs:
       - run: mix deps.get
       - run: mix compile --warnings-as-errors
       - run: mix test
+
+  dialyzer:
+    name: Dialyzer
+    runs-on: ubuntu-latest
+    env:
+      MIX_ENV: dev
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: "27"
+          elixir-version: "1.18"
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/cache@v4
+        with:
+          path: _build/dev/*.plt*
+          key: plt-${{ runner.os }}-otp27-elixir1.18-${{ hashFiles('mix.lock') }}
+          restore-keys: plt-${{ runner.os }}-otp27-elixir1.18-
+
+      - run: mix deps.get
+      - run: mix dialyzer
