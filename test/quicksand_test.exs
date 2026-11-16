@@ -414,6 +414,19 @@ defmodule QuicksandTest do
       Quicksand.stop(rt)
     end
 
+    test "memory limit error is always reported as out of memory" do
+      for limit <- [2 * 1024 * 1024, 4 * 1024 * 1024],
+          code <- [
+            "const arr = []; while(true) { arr.push('x'.repeat(1000)); }",
+            "(() => { const arr = []; while(true) { arr.push('x'.repeat(1000)); } })()"
+          ] do
+        {:ok, rt} = Quicksand.start(memory_limit: limit)
+        assert {:error, msg} = Quicksand.eval(rt, code)
+        assert msg =~ "out of memory"
+        assert :ok = Quicksand.stop(rt)
+      end
+    end
+
     test "runtime usable after memory limit exceeded" do
       # Use a larger limit so QuickJS can GC and recover after OOM
       {:ok, rt} = Quicksand.start(memory_limit: 2 * 1024 * 1024)

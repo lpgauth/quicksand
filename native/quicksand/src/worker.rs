@@ -291,6 +291,9 @@ fn format_caught_error(err: rquickjs::CaughtError<'_>) -> String {
                 format!("{val:?}")
             }
         }
+        // QuickJS throws null when it cannot allocate the out-of-memory error
+        // itself. A script throwing null literally is reported the same way.
+        rquickjs::CaughtError::Value(val) if val.is_null() => "out of memory".to_string(),
         rquickjs::CaughtError::Value(val) => format!("Thrown value: {val:?}"),
         rquickjs::CaughtError::Error(e) => format!("{e}"),
     }
