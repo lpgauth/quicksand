@@ -6,6 +6,7 @@
 
 mod atoms;
 mod convert;
+mod interrupt;
 mod nif;
 mod runtime;
 mod worker;

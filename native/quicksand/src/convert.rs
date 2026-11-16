@@ -5,16 +5,25 @@
 //! the reverse, so terms are first decoded into a `TermValue`.
 
 use std::borrow::Cow;
+use std::mem;
 
-use rquickjs::{Array, Ctx, Object, Value};
+use rquickjs::function::This;
+use rquickjs::{Array, Coerced, Ctx, FromJs, Function, IntoAtom, Object, Value};
 use rustler::types::atom;
-use rustler::{Encoder, Env, MapIterator, Term};
+use rustler::{BigInt, Encoder, Env, MapIterator, Term};
+
+use crate::interrupt::Interrupt;
 
 /// Containers nested deeper than this fail to convert, which also stops cycles.
 const MAX_DEPTH: u32 = 64;
 
 /// The largest integer a JS number holds exactly (`Number.MAX_SAFE_INTEGER`).
 const MAX_SAFE_INTEGER: f64 = 9_007_199_254_740_991.0;
+
+/// How many values to convert between checks of the eval's deadline.
+const INTERRUPT_CHECK_INTERVAL: usize = 1024;
+
+const OUT_OF_MEMORY: &str = "out of memory";
 
 /// A callback's reply: the value to return to JS, or the message to throw.
 pub type CallbackReply = Result<TermValue, String>;
@@ -27,6 +36,7 @@ pub enum JsValue {
     Null,
     Bool(bool),
     Int(i64),
+    BigInt(BigInt),
     Float(f64),
     String(String),
     Array(Vec<JsValue>),
@@ -39,6 +49,7 @@ impl Encoder for JsValue {
             JsValue::Null => atom::nil().encode(env),
             JsValue::Bool(boolean) => boolean.encode(env),
             JsValue::Int(integer) => integer.encode(env),
+            JsValue::BigInt(integer) => integer.encode(env),
             JsValue::Float(float) => float.encode(env),
             JsValue::String(string) => string.encode(env),
             JsValue::Array(items) => items.encode(env),
@@ -52,50 +63,140 @@ impl Encoder for JsValue {
     }
 }
 
-pub fn js_to_term<'js>(ctx: &Ctx<'js>, value: Value<'js>) -> Result<JsValue, String> {
-    js_to_term_at_depth(ctx, value, 0)
+/// Copies JS values out of the runtime. Every value is charged against a byte
+/// budget, so results count toward the memory limit, and the conversion stops
+/// when the eval is interrupted. Without both, a sparse array or a value that
+/// shares references could expand far past the JS heap.
+pub struct Converter<'a, 'js> {
+    ctx: &'a Ctx<'js>,
+    interrupt: &'a Interrupt,
+    budget: usize,
+    converted: usize,
 }
 
-fn js_to_term_at_depth<'js>(
-    ctx: &Ctx<'js>,
-    value: Value<'js>,
-    depth: u32,
-) -> Result<JsValue, String> {
-    if depth > MAX_DEPTH {
-        return Err("Maximum nesting depth exceeded".to_string());
+impl<'a, 'js> Converter<'a, 'js> {
+    pub fn new(ctx: &'a Ctx<'js>, interrupt: &'a Interrupt, budget: usize) -> Self {
+        Self {
+            ctx,
+            interrupt,
+            budget,
+            converted: 0,
+        }
     }
 
-    if value.is_undefined() || value.is_null() || value.is_function() {
-        return Ok(JsValue::Null);
+    pub fn convert(&mut self, value: Value<'js>) -> Result<JsValue, String> {
+        self.convert_at_depth(value, 0)
     }
 
-    if let Some(boolean) = value.as_bool() {
-        return Ok(JsValue::Bool(boolean));
+    fn convert_at_depth(&mut self, value: Value<'js>, depth: u32) -> Result<JsValue, String> {
+        if depth > MAX_DEPTH {
+            return Err("Maximum nesting depth exceeded".to_string());
+        }
+        self.charge(mem::size_of::<JsValue>())?;
+
+        if value.is_undefined() || value.is_null() || value.is_function() || value.is_symbol() {
+            return Ok(JsValue::Null);
+        }
+
+        if let Some(boolean) = value.as_bool() {
+            return Ok(JsValue::Bool(boolean));
+        }
+
+        if let Some(integer) = value.as_int() {
+            return Ok(JsValue::Int(i64::from(integer)));
+        }
+
+        if let Some(float) = value.as_float() {
+            return Ok(float_to_term(float));
+        }
+
+        if value.is_big_int() {
+            return self.big_int(value);
+        }
+
+        if let Some(string) = value.as_string() {
+            return self.string(string).map(JsValue::String);
+        }
+
+        let Some(object) = value.as_object() else {
+            return Ok(JsValue::Null);
+        };
+
+        if value.is_array() {
+            self.array(object, depth).map(JsValue::Array)
+        } else {
+            self.object(object, depth).map(JsValue::Object)
+        }
     }
 
-    if let Some(integer) = value.as_int() {
-        return Ok(JsValue::Int(i64::from(integer)));
+    fn charge(&mut self, bytes: usize) -> Result<(), String> {
+        self.budget = self
+            .budget
+            .checked_sub(bytes)
+            .ok_or_else(|| OUT_OF_MEMORY.to_string())?;
+        self.converted += 1;
+        if self.converted.is_multiple_of(INTERRUPT_CHECK_INTERVAL) && self.interrupt.is_due() {
+            return Err("interrupted".to_string());
+        }
+        Ok(())
     }
 
-    if let Some(float) = value.as_float() {
-        return Ok(float_to_term(float));
+    fn string(&mut self, string: &rquickjs::String<'js>) -> Result<String, String> {
+        let string = to_rust_string(self.ctx, string).map_err(|error| self.describe(error))?;
+        self.charge(string.len())?;
+        Ok(string)
     }
 
-    if let Some(string) = value.as_string() {
-        let string = string
-            .to_string()
-            .map_err(|error| format!("String conversion error: {error}"))?;
-        return Ok(JsValue::String(string));
+    fn big_int(&mut self, value: Value<'js>) -> Result<JsValue, String> {
+        let Coerced(digits) =
+            Coerced::<String>::from_js(self.ctx, value).map_err(|error| self.describe(error))?;
+        self.charge(digits.len())?;
+        digits
+            .parse::<BigInt>()
+            .map(JsValue::BigInt)
+            .map_err(|error| format!("Failed to convert BigInt {digits}: {error}"))
     }
 
-    let Some(object) = value.as_object() else {
-        return Ok(JsValue::Null);
-    };
+    fn array(&mut self, array: &Object<'js>, depth: u32) -> Result<Vec<JsValue>, String> {
+        let length = self.property(array, "length")?;
+        let length = length.as_number().map_or(0, array_length);
+        let mut items = Vec::with_capacity(length.min(1024) as usize);
+        for index in 0..length {
+            let item = self.property(array, index)?;
+            items.push(self.convert_at_depth(item, depth + 1)?);
+        }
+        Ok(items)
+    }
 
-    if value.is_array() {
-        array_to_term(ctx, object, depth).map(JsValue::Array)
-    } else {
-        object_to_term(ctx, object, depth).map(JsValue::Object)
+    fn object(
+        &mut self,
+        object: &Object<'js>,
+        depth: u32,
+    ) -> Result<Vec<(String, JsValue)>, String> {
+        let mut pairs = Vec::new();
+        for key in object.keys::<rquickjs::String>() {
+            let key = key.map_err(|error| self.describe(error))?;
+            let value = self.property(object, key.clone())?;
+            if !value.is_function() {
+                let name = self.string(&key)?;
+                pairs.push((name, self.convert_at_depth(value, depth + 1)?));
+            }
+        }
+        Ok(pairs)
+    }
+
+    fn property<K: IntoAtom<'js>>(
+        &self,
+        object: &Object<'js>,
+        key: K,
+    ) -> Result<Value<'js>, String> {
+        object
+            .get(key)
+            .map_err(|error| format!("Failed to read property: {}", self.describe(error)))
+    }
+
+    fn describe(&self, error: rquickjs::Error) -> String {
+        describe_error(self.ctx, error)
     }
 }
 
@@ -109,39 +210,92 @@ fn float_to_term(float: f64) -> JsValue {
     }
 }
 
-fn array_to_term<'js>(
-    ctx: &Ctx<'js>,
-    array: &Object<'js>,
-    depth: u32,
-) -> Result<Vec<JsValue>, String> {
-    let length: i32 = array.get("length").unwrap_or(0);
-    let length = u32::try_from(length).unwrap_or(0);
-    let mut items = Vec::with_capacity(length.min(1024) as usize);
-    for index in 0..length {
-        let item: Value = array
-            .get(index)
-            .unwrap_or_else(|_| Value::new_undefined(ctx.clone()));
-        items.push(js_to_term_at_depth(ctx, item, depth + 1)?);
+fn array_length(length: f64) -> u32 {
+    if length.is_finite() && length > 0.0 {
+        length.min(f64::from(u32::MAX)) as u32
+    } else {
+        0
     }
-    Ok(items)
 }
 
-fn object_to_term<'js>(
-    ctx: &Ctx<'js>,
-    object: &Object<'js>,
-    depth: u32,
-) -> Result<Vec<(String, JsValue)>, String> {
-    let mut pairs = Vec::new();
-    let keys = object.keys::<String>().flatten();
-    for key in keys {
-        let value: Value = object
-            .get(key.as_str())
-            .unwrap_or_else(|_| Value::new_undefined(ctx.clone()));
-        if !value.is_function() {
-            pairs.push((key, js_to_term_at_depth(ctx, value, depth + 1)?));
+/// Converts a JS string to UTF-8, replacing lone surrogates with U+FFFD.
+fn to_rust_string<'js>(ctx: &Ctx<'js>, string: &rquickjs::String<'js>) -> rquickjs::Result<String> {
+    if let Ok(converted) = string.to_string() {
+        return Ok(converted);
+    }
+    let prototype: Object = ctx.globals().get::<_, Object>("String")?.get("prototype")?;
+    let to_well_formed: Function = prototype.get("toWellFormed")?;
+    let well_formed: rquickjs::String = to_well_formed.call((This(string.clone()),))?;
+    well_formed.to_string()
+}
+
+/// Describes an rquickjs error, taking the pending exception if it is one.
+pub fn describe_error(ctx: &Ctx<'_>, error: rquickjs::Error) -> String {
+    if error.is_exception() {
+        describe_thrown(ctx, ctx.catch())
+    } else {
+        error.to_string()
+    }
+}
+
+/// Describes a thrown JS value as an `{:error, message}` string: an `Error`'s
+/// message and stack, a string as itself, and anything else as JSON or its
+/// `String()` form.
+pub fn describe_thrown<'js>(ctx: &Ctx<'js>, value: Value<'js>) -> String {
+    // QuickJS throws null when it cannot allocate the out-of-memory error
+    // itself. A script throwing null literally is reported the same way.
+    if value.is_null() {
+        return OUT_OF_MEMORY.to_string();
+    }
+
+    if let Some(string) = value.as_string() {
+        return to_rust_string(ctx, string).unwrap_or_default();
+    }
+
+    if let Some(object) = value.as_object().filter(|_| value.is_error()) {
+        let message = string_property(ctx, object, "message");
+        let stack = string_property(ctx, object, "stack");
+        return if stack.is_empty() {
+            message
+        } else {
+            format!("{message}\n{stack}")
+        };
+    }
+
+    if value.is_object() {
+        match ctx.json_stringify(value.clone()) {
+            Ok(Some(json)) => {
+                if let Ok(json) = to_rust_string(ctx, &json) {
+                    return json;
+                }
+            }
+            Ok(None) => {}
+            Err(_) => {
+                ctx.catch();
+            }
         }
     }
-    Ok(pairs)
+
+    match Coerced::<String>::from_js(ctx, value.clone()) {
+        Ok(Coerced(string)) => string,
+        Err(_) => {
+            ctx.catch();
+            value.type_name().to_string()
+        }
+    }
+}
+
+fn string_property<'js>(ctx: &Ctx<'js>, object: &Object<'js>, key: &str) -> String {
+    match object.get::<_, Value>(key) {
+        Ok(value) => value
+            .as_string()
+            .and_then(|string| to_rust_string(ctx, string).ok())
+            .unwrap_or_default(),
+        Err(_) => {
+            ctx.catch();
+            String::new()
+        }
+    }
 }
 
 // ── Erlang → JS ─────────────────────────────────────────────────────────────
@@ -153,6 +307,7 @@ pub enum TermValue {
     Nil,
     Bool(bool),
     Int(i64),
+    BigInt(BigInt),
     Float(f64),
     String(String),
     Atom(String),
@@ -183,6 +338,10 @@ fn term_to_intermediate_at_depth(term: Term<'_>, depth: u32) -> Result<TermValue
 
     if let Ok(integer) = term.decode::<i64>() {
         return Ok(TermValue::Int(integer));
+    }
+
+    if let Ok(integer) = term.decode::<BigInt>() {
+        return Ok(TermValue::BigInt(integer));
     }
 
     if let Ok(float) = term.decode::<f64>() {
@@ -246,6 +405,15 @@ fn intermediate_to_js_at_depth<'js>(
             Ok(small) => Value::new_int(ctx.clone(), small),
             Err(_) => Value::new_float(ctx.clone(), *integer as f64),
         }),
+        TermValue::BigInt(integer) => {
+            let construct: Function = ctx
+                .globals()
+                .get("BigInt")
+                .map_err(|error| describe_error(ctx, error))?;
+            construct
+                .call((integer.to_string(),))
+                .map_err(|error| format!("Failed to create BigInt: {}", describe_error(ctx, error)))
+        }
         TermValue::Float(float) => Ok(Value::new_float(ctx.clone(), *float)),
         TermValue::String(string) | TermValue::Atom(string) => {
             let string = rquickjs::String::from_str(ctx.clone(), string)

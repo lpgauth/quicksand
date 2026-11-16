@@ -50,6 +50,16 @@ QUICKSAND_BUILD=true mix deps.compile quicksand
 :ok = Quicksand.stop(rt)
 ```
 
+### Promises
+
+Pending jobs run before `eval` returns, and a returned promise is awaited:
+
+```elixir
+{:ok, 42} = Quicksand.eval(rt, "(async () => 42)()")
+{:error, "nope\n" <> _stack} = Quicksand.eval(rt, "Promise.reject(new Error('nope'))")
+{:error, "Promise did not settle"} = Quicksand.eval(rt, "new Promise(() => {})")
+```
+
 ### Resource Limits
 
 ```elixir
@@ -65,6 +75,8 @@ QUICKSAND_BUILD=true mix deps.compile quicksand
 # Runtime remains usable after timeout
 {:ok, 42} = Quicksand.eval(rt, "42")
 ```
+
+`:timeout` covers the whole eval, including time spent in callbacks and in promise jobs. `:memory_limit` also caps the size of the converted result, so a script cannot return more data than its heap allows. `:max_stack_size` can be at most 16 MiB. Unknown options and values that are not positive integers raise `ArgumentError`.
 
 ### Callbacks
 
@@ -91,10 +103,12 @@ callbacks = %{
 """, callbacks)
 ```
 
-Callbacks must return `{:ok, value}` or `{:error, reason}`:
+Callback names can be strings or atoms. Callbacks must return `{:ok, value}` or `{:error, reason}`:
 
-- `{:ok, value}` — value is converted to JS and returned to the caller
-- `{:error, reason}` — throws a JS exception with the reason as the message
+- `{:ok, value}`: the value is converted to JS and returned to the caller.
+- `{:error, reason}`: throws a JS `Error` with the reason as its message. An atom reason becomes its name, and any other non-string reason its `inspect/1` form.
+
+A callback that raises, throws or exits throws a JS `Error` too.
 
 ```elixir
 callbacks = %{
@@ -108,6 +122,8 @@ callbacks = %{
   try { risky(-1); } catch(e) { e.message; }
 """, callbacks)
 ```
+
+A callback can share its name with an existing global, such as `JSON`. The global is shadowed for that eval only and restored afterwards.
 
 ### Lifecycle
 
@@ -144,9 +160,23 @@ Quicksand.alive?(rt)  # false
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `:timeout` | integer (ms) | `30_000` | Max JS execution time per eval |
-| `:memory_limit` | integer (bytes) | `268_435_456` (256 MB) | Max JS heap allocation |
-| `:max_stack_size` | integer (bytes) | `1_048_576` (1 MB) | Max JS call stack size |
+| `:timeout` | integer (ms) | `30_000` | Max time per eval, including callbacks; at most `4_294_967_295` |
+| `:memory_limit` | integer (bytes) | `268_435_456` (256 MB) | Max JS heap, which also caps the converted result |
+| `:max_stack_size` | integer (bytes) | `1_048_576` (1 MB) | Max JS call stack; at most `16_777_216` (16 MB) |
+
+### Errors
+
+`eval` returns `{:error, message}` with:
+
+| Message | Cause |
+|---------|-------|
+| `"timeout"` | The eval ran past `:timeout` |
+| `"dead_runtime"` | The runtime was stopped before or during the eval |
+| `"out of memory"` | The JS heap or the converted result exceeded `:memory_limit` |
+| `"Maximum nesting depth exceeded"` | The result nests deeper than 64 levels, or refers to itself |
+| anything else | The thrown value: an `Error`'s message and stack trace, a string as is, any other value as JSON or its `String()` form |
+
+QuickJS throws `null` when it cannot allocate the out-of-memory error itself, so a script that throws `null` also reports `"out of memory"`.
 
 ### Reserved global names
 
@@ -169,11 +199,16 @@ Don't define these in your user JS — overwriting them silently breaks all Elix
 | `true`, `false` | `true`, `false` |
 | integer | integer |
 | float | float (integer if no fractional part) |
-| string | binary string |
+| BigInt | integer |
+| string | binary string (lone surrogates become U+FFFD) |
 | Array | list |
-| Object | map (string keys) |
-| function | `nil` |
+| Object | map of its own enumerable string keys |
+| Promise | its resolved value (a rejection is an error) |
+| function, Symbol | `nil` |
 | `NaN`, `Infinity` | `nil` |
+| Date, Map, Set, typed array | map of their own enumerable keys (`%{}` for Date, Map and Set) |
+
+Getters run during conversion, and one that throws fails the eval.
 
 ### Elixir to JS (callback results)
 
@@ -181,12 +216,13 @@ Don't define these in your user JS — overwriting them silently breaks all Elix
 |--------|------------|
 | `nil` | `null` |
 | `true`, `false` | `true`, `false` |
-| integer | number |
+| integer | number (BigInt beyond 64 bits; numbers above 2^53 lose precision) |
 | float | number |
 | binary string | string |
 | atom | string |
 | list | Array |
-| map | Object |
+| map | Object (keys must be strings, atoms or integers) |
+| tuple, pid, reference, function | not supported (throws a JS `Error`) |
 
 ## License
 

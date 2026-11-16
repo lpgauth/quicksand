@@ -1,6 +1,7 @@
 //! The `Runtime` resource handed to Elixir and the registry of pending callbacks.
 
 use std::collections::HashMap;
+use std::mem;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SendError, Sender};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -9,9 +10,10 @@ use std::time::Duration;
 use rustler::{Encoder, LocalPid, OwnedEnv, Resource};
 
 use crate::convert::CallbackReply;
+use crate::interrupt::Interrupt;
 use crate::worker::Message;
 
-/// Pending `eval/3` callback replies, shared by NIF calls and the worker thread.
+/// Pending callback replies, shared by NIF calls and the worker thread.
 #[derive(Default)]
 pub struct CallbackRegistry {
     pending: Mutex<HashMap<u64, Sender<CallbackReply>>>,
@@ -36,10 +38,20 @@ impl CallbackRegistry {
         }
     }
 
+    /// Fails every pending callback with `reason`, waking the worker.
+    pub fn cancel_all(&self, reason: &str) {
+        let pending = mem::take(&mut *self.pending());
+        for sender in pending.into_values() {
+            let _ = sender.send(Err(reason.to_string()));
+        }
+    }
+
     pub fn clear(&self) {
         self.pending().clear();
     }
 
+    /// Marks the eval tagged `tag` as one its caller stopped waiting for, so
+    /// the worker drops its result instead of sending it.
     pub fn abandon(&self, tag: u64) {
         self.abandoned_tag.store(tag, Ordering::Relaxed);
     }
@@ -60,24 +72,48 @@ impl CallbackRegistry {
 pub struct Runtime {
     sender: Sender<Message>,
     pub registry: Arc<CallbackRegistry>,
-    pub interrupt: Arc<AtomicBool>,
-    pub alive: AtomicBool,
+    pub interrupt: Arc<Interrupt>,
+    // Shared with the worker thread, which clears it when it exits.
+    pub alive: Arc<AtomicBool>,
     pub timeout: Duration,
 }
 
 impl Runtime {
-    pub fn new(sender: Sender<Message>, interrupt: Arc<AtomicBool>, timeout: Duration) -> Self {
+    pub fn new(
+        sender: Sender<Message>,
+        registry: Arc<CallbackRegistry>,
+        interrupt: Arc<Interrupt>,
+        alive: Arc<AtomicBool>,
+        timeout: Duration,
+    ) -> Self {
         Self {
             sender,
-            registry: Arc::new(CallbackRegistry::default()),
+            registry,
             interrupt,
-            alive: AtomicBool::new(true),
+            alive,
             timeout,
         }
     }
 
+    #[must_use]
+    pub fn is_alive(&self) -> bool {
+        self.alive.load(Ordering::Relaxed)
+    }
+
     pub fn send(&self, message: Message) -> Result<(), SendError<Message>> {
         self.sender.send(message)
+    }
+
+    /// Stops the worker, interrupting any running eval. Returns a receiver
+    /// that gets a message once the worker has stopped, or `None` if it
+    /// already had.
+    pub fn stop(&self) -> Option<Receiver<()>> {
+        self.alive.store(false, Ordering::Relaxed);
+        self.interrupt.stop();
+        self.registry.cancel_all("Runtime stopped");
+        let (tx, rx) = mpsc::channel();
+        self.sender.send(Message::Stop { reply: tx }).ok()?;
+        Some(rx)
     }
 }
 
@@ -86,10 +122,7 @@ impl Resource for Runtime {}
 
 impl Drop for Runtime {
     fn drop(&mut self) {
-        self.alive.store(false, Ordering::Relaxed);
-        self.interrupt.store(true, Ordering::Relaxed);
-        let (tx, _rx) = mpsc::channel();
-        let _ = self.sender.send(Message::Stop { reply: tx });
+        let _ = self.stop();
     }
 }
 
