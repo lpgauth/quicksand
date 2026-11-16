@@ -315,6 +315,38 @@ defmodule QuicksandTest do
       assert :ok = Quicksand.stop(rt)
     end
 
+    test "jobs left by a timeout do not run in the next eval" do
+      {:ok, rt} = Quicksand.start(timeout: 100)
+      loop = "Promise.resolve().then(() => { while(true) {} });"
+      assert {:error, "timeout"} = Quicksand.eval(rt, loop <> loop <> "1")
+      assert {:ok, 42} = Quicksand.eval(rt, "21 * 2")
+      assert :ok = Quicksand.stop(rt)
+    end
+
+    test "callbacks are not called after a timeout" do
+      {:ok, rt} = Quicksand.start(timeout: 100)
+      callbacks = %{"late" => fn [] -> {:ok, nil} end}
+
+      code =
+        "Promise.resolve().then(() => { while(true) {} }); Promise.resolve().then(() => late()); 1"
+
+      assert {:error, "timeout"} = Quicksand.eval(rt, code, callbacks)
+      assert {:ok, 42} = Quicksand.eval(rt, "21 * 2")
+      refute_received {:quicksand_callback, _, _, _}
+      assert :ok = Quicksand.stop(rt)
+    end
+
+    test "a throwing job does not stop later jobs" do
+      {:ok, rt} = Quicksand.start()
+
+      code =
+        "globalThis.x = 0; queueMicrotask(() => { throw new Error('boom') }); queueMicrotask(() => { x = 1 }); 1"
+
+      assert {:ok, 1} = Quicksand.eval(rt, code)
+      assert {:ok, 1} = Quicksand.eval(rt, "x")
+      assert :ok = Quicksand.stop(rt)
+    end
+
     test "out of memory inside a job" do
       {:ok, rt} = Quicksand.start(memory_limit: 2 * 1024 * 1024)
 
@@ -324,6 +356,14 @@ defmodule QuicksandTest do
       assert {:ok, 1} = Quicksand.eval(rt, code)
       assert {:ok, 42} = Quicksand.eval(rt, "21 * 2")
       assert :ok = Quicksand.stop(rt)
+    end
+
+    test "a job storm after a timeout does not hold the worker" do
+      {:ok, rt} = Quicksand.start(timeout: 200)
+      code = "function f() { Promise.resolve().then(f); Promise.resolve().then(f) } f(); 1"
+      assert {:error, "timeout"} = Quicksand.eval(rt, code)
+      {elapsed, :ok} = :timer.tc(fn -> Quicksand.stop(rt) end, :millisecond)
+      assert elapsed < 100
     end
   end
 

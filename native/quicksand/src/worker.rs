@@ -10,6 +10,11 @@ use rustler::LocalPid;
 
 type ResultSender = std::sync::mpsc::Sender<Result<JsValue, String>>;
 
+// QuickJS cannot discard queued jobs, so after an interrupt the remaining ones
+// still run (and abort at their next interrupt check) instead of leaking into
+// the next eval. Short jobs can keep queueing more, so the drain is capped.
+const MAX_JOBS_AFTER_INTERRUPT: usize = 10_000;
+
 pub enum Message {
     Eval(String, ResultSender),
     Stop(std::sync::mpsc::Sender<()>),
@@ -109,11 +114,13 @@ impl Worker {
     }
 
     fn drain_jobs(&self) {
-        loop {
-            match self.rt.execute_pending_job() {
-                Ok(false) => break,
-                Ok(true) => continue,
-                Err(_) => break,
+        let mut budget = MAX_JOBS_AFTER_INTERRUPT;
+        while !matches!(self.rt.execute_pending_job(), Ok(false)) {
+            if self.interrupt.load(Ordering::Relaxed) {
+                budget -= 1;
+                if budget == 0 {
+                    break;
+                }
             }
         }
     }
@@ -144,6 +151,7 @@ impl Worker {
     ) -> Result<(), String> {
         let cb = Arc::clone(callbacks);
         let pid = *caller_pid;
+        let interrupt = Arc::clone(&self.interrupt);
 
         self.ctx.with(|ctx| {
             let globals = ctx.globals();
@@ -155,6 +163,18 @@ impl Worker {
             let dispatch = Function::new(
                 ctx.clone(),
                 move |ctx: rquickjs::Ctx<'_>, name: String| -> rquickjs::Result<String> {
+                    if interrupt.load(Ordering::Relaxed) {
+                        ctx.throw(
+                            rquickjs::String::from_str(
+                                ctx.clone(),
+                                &format!("Callback '{}' called after interrupt", name),
+                            )
+                            .map_err(|_| rquickjs::Error::Exception)?
+                            .into(),
+                        );
+                        return Err(rquickjs::Error::Exception);
+                    }
+
                     let args_val: rquickjs::Value = ctx
                         .globals()
                         .get("__quicksand_cb_args")
