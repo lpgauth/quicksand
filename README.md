@@ -7,6 +7,7 @@ Quicksand embeds the QuickJS-NG engine as a Rustler NIF, giving you in-process J
 ## Features
 
 - Sandboxed JS with no filesystem, network, or OS access
+- Standard ECMAScript built-ins only: no `console`, timers, `fetch`, `TextEncoder` or `URL` (expose what you need as callbacks). `queueMicrotask` and promises work.
 - Configurable memory limit, execution timeout, and stack size
 - Pre-registered Elixir callbacks callable from JS
 - Direct Erlang term <-> JS value conversion (no JSON serialization)
@@ -55,6 +56,8 @@ QUICKSAND_BUILD=true mix deps.compile quicksand
 Pending jobs run before `eval` returns, and a returned promise is awaited:
 
 ```elixir
+{:ok, rt} = Quicksand.start()
+
 {:ok, 42} = Quicksand.eval(rt, "(async () => 42)()")
 {:error, "nope\n" <> _stack} = Quicksand.eval(rt, "Promise.reject(new Error('nope'))")
 {:error, "Promise did not settle"} = Quicksand.eval(rt, "new Promise(() => {})")
@@ -97,9 +100,11 @@ callbacks = %{
 }
 
 {:ok, "Alice"} = Quicksand.eval(rt, """
-  const user = fetch_user(1);
-  log("Found user: " + user.name);
-  user.name;
+  {
+    const user = fetch_user(1);
+    log("Found user: " + user.name);
+    user.name;
+  }
 """, callbacks)
 ```
 
@@ -138,6 +143,10 @@ Quicksand.alive?(rt)  # true
 {:ok, 42} = Quicksand.eval(rt, "globalThis.x = 42")
 {:ok, 42} = Quicksand.eval(rt, "x")
 
+# So do top-level let, const and class declarations
+{:ok, 1} = Quicksand.eval(rt, "const y = 1; y")
+{:error, "redeclaration of 'y'" <> _} = Quicksand.eval(rt, "const y = 1; y")
+
 # Stop is idempotent
 :ok = Quicksand.stop(rt)
 :ok = Quicksand.stop(rt)
@@ -147,6 +156,8 @@ Quicksand.alive?(rt)  # false
 # Eval on stopped runtime returns error (doesn't raise)
 {:error, "dead_runtime"} = Quicksand.eval(rt, "1")
 ```
+
+To run the same script more than once, wrap it in a block (`{ ... }`) or a function so its declarations stay local.
 
 ## API
 
@@ -176,20 +187,12 @@ Quicksand.alive?(rt)  # false
 | `"dead_runtime"` | The runtime was stopped before or during the eval |
 | `"out of memory"` | The JS heap or the converted result exceeded `:memory_limit` |
 | `"Maximum nesting depth exceeded"` | The result nests deeper than 64 levels, or refers to itself |
-| anything else | The thrown value: an `Error`'s message and stack trace, a string as is, any other value as JSON or its `String()` form |
+| `"Promise did not settle"` | The returned promise was still pending once all jobs had run |
+| `"JavaScript source must be valid UTF-8"` | The code binary is not UTF-8 |
+| `"Cannot eval on a runtime from inside one of its own callbacks"` | A callback called `eval` on the runtime that is running it |
+| anything else | The thrown value: an `Error`'s message and stack trace followed by each `Caused by:`, a string as is, any other value as JSON or its `String()` form |
 
 QuickJS throws `null` when it cannot allocate the out-of-memory error itself, so a script that throws `null` also reports `"out of memory"`.
-
-### Reserved global names
-
-When `eval/3` is in callback mode, quicksand installs four `globalThis.__quicksand_*` properties on the JS runtime to plumb callback dispatch:
-
-- `__quicksand_make_wrapper` — factory that builds the Elixir-callback wrapper functions injected as JS globals.
-- `__quicksand_dispatch` — called by the wrapper to message the Elixir process.
-- `__quicksand_cb_args` — slot the wrapper writes per-call arguments into.
-- `__quicksand_cb_result` — slot Elixir writes the result into.
-
-Callback names starting with `__quicksand_` are rejected. Don't define these in your user JS — overwriting them silently breaks all Elixir callbacks in that runtime. The leading double-underscore is a convention signaling "implementation detail, don't touch", matching the same convention QuickJS-NG uses internally.
 
 ## Type Conversion
 
@@ -200,7 +203,7 @@ Callback names starting with `__quicksand_` are rejected. Don't define these in 
 | `null`, `undefined` | `nil` |
 | `true`, `false` | `true`, `false` |
 | integer | integer |
-| float | float (integer if no fractional part) |
+| float | float (integer if it has no fractional part and is within ±2^53) |
 | BigInt | integer |
 | string | binary string (lone surrogates become U+FFFD) |
 | Array | list |

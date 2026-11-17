@@ -61,7 +61,7 @@ jobs:
 
       - run: mix deps.get
       - run: mix compile --warnings-as-errors
-      - run: mix test
+      - run: mix test --warnings-as-errors
 
   test-musl:
     name: Test (musl / Alpine)
@@ -79,7 +79,7 @@ jobs:
 
       - run: mix local.hex --force && mix local.rebar --force
       - run: mix deps.get
-      - run: mix test
+      - run: mix test --warnings-as-errors
 
   dialyzer:
     name: Dialyzer

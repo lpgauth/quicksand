@@ -50,10 +50,9 @@ BEAM Process
 
 ### Callback Mechanism
 
-- `__quicksand_dispatch`: Rust native function installed per eval/3 call. Reads args from `__quicksand_cb_args` global, sends to Elixir via `send_to_pid`, blocks on `CallbackRegistry` channel for response.
-- `__quicksand_make_wrapper`: Persistent JS factory (installed once in `Worker::try_new`, frozen via `Object.defineProperty`). Creates per-callback wrapper functions that set args global, call dispatch, retrieve result from `__quicksand_cb_result` global.
-- Callback names are passed as JS function parameters to the factory, never interpolated into eval'd code (prevents JS injection).
+- Each callback name becomes a native global function built in `Worker::callback_function`. It converts its arguments, sends `{:quicksand_callback, tag, id, name, args}` to the caller, blocks on its `CallbackRegistry` channel until `respond_callback` answers or the deadline passes, and returns the converted reply. No JS shim or helper global is involved, so user code cannot break callbacks by replacing builtins.
 - A callback name can shadow an existing global. `install_callbacks` saves its property descriptor and `remove_callbacks` restores it, using `Object.getOwnPropertyDescriptor`/`defineProperty` captured before any user code runs.
+- A callback function kept past its eval (stored in a global, say) throws when called, since its tag is no longer tracked.
 - Callback errors, conversion failures and timeouts are thrown as JS `Error` objects (`Exception::throw_message`).
 
 ### Type Conversion

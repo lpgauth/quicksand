@@ -49,6 +49,11 @@ defmodule QuicksandTest do
       end
     end
 
+    test "the NIF rejects a zero memory limit even if called directly" do
+      assert {:error, "memory_limit must be positive"} =
+               Quicksand.Native.start_runtime(make_ref(), 1_000, 0, 1024 * 1024)
+    end
+
     test "start rejects limits that are not positive or too large" do
       for opts <- [
             [timeout: 0],
@@ -192,6 +197,16 @@ defmodule QuicksandTest do
       assert {:error, "TypeError\n" <> _} = Quicksand.eval(rt, "throw new TypeError()")
     end
 
+    test "error causes are included", %{rt: rt} do
+      code = "throw new Error('outer', {cause: new Error('inner', {cause: 'root'})})"
+      assert {:error, msg} = Quicksand.eval(rt, code)
+      assert msg =~ ~r/\Aouter\n.*\nCaused by: inner\n.*\nCaused by: root\z/s
+
+      code = "const e = new Error('loop'); e.cause = e; throw e"
+      assert {:error, msg} = Quicksand.eval(rt, code)
+      assert length(String.split(msg, "Caused by:")) == 9
+    end
+
     test "returned promises are awaited", %{rt: rt} do
       assert {:ok, 42} = Quicksand.eval(rt, "Promise.resolve(42)")
       assert {:ok, 42} = Quicksand.eval(rt, "(async () => { await null; return 42 })()")
@@ -243,8 +258,17 @@ defmodule QuicksandTest do
       assert {:ok, %{"\uFFFD" => 1}} = Quicksand.eval(rt, "({'\\uDC00': 1})")
     end
 
+    test "keys that become the same after surrogate replacement", %{rt: rt} do
+      assert {:ok, %{"\uFFFD" => 2, "ok" => 3}} =
+               Quicksand.eval(rt, "({'\\uD800': 1, '\\uDC00': 2, ok: 3})")
+    end
+
     test "NUL bytes in source", %{rt: rt} do
-      assert {:ok, 3} = Quicksand.eval(rt, "'a" <> <<0>> <> "b'.length")
+      nul = <<0>>
+      assert {:ok, 3} = Quicksand.eval(rt, "'a" <> nul <> "b'.length")
+      assert {:ok, 1} = Quicksand.eval(rt, "'\\" <> nul <> "'.length")
+      assert {:ok, 2} = Quicksand.eval(rt, "'\\\\" <> nul <> "'.length")
+      assert {:ok, true} = Quicksand.eval(rt, "/\\" <> nul <> "/.test('\\0')")
     end
 
     test "source that is not UTF-8", %{rt: rt} do
@@ -519,16 +543,46 @@ defmodule QuicksandTest do
       assert {:ok, true} = Quicksand.eval(rt, same_prototype)
     end
 
-    test "reserved and invalid callback names raise", %{rt: rt} do
+    test "invalid and duplicate callback names raise", %{rt: rt} do
       noop = fn _ -> {:ok, nil} end
-
-      assert_raise ArgumentError, ~r/reserved/, fn ->
-        Quicksand.eval(rt, "1", %{"__quicksand_dispatch" => noop})
-      end
 
       assert_raise ArgumentError, ~r/valid UTF-8/, fn ->
         Quicksand.eval(rt, "1", %{<<0xFF>> => noop})
       end
+
+      assert_raise ArgumentError, ~r/unique/, fn ->
+        Quicksand.eval(rt, "1", %{:f => noop, "f" => noop})
+      end
+    end
+
+    test "callbacks named like the globals JS relies on", %{rt: rt} do
+      callbacks = %{
+        "Array" => fn [] -> {:ok, "array"} end,
+        "globalThis" => fn [] -> {:ok, "global"} end,
+        "__quicksand_dispatch" => fn [] -> {:ok, "dispatch"} end
+      }
+
+      assert {:ok, ["array", "global", "dispatch"]} =
+               Quicksand.eval(rt, "[Array(), globalThis(), __quicksand_dispatch()]", callbacks)
+
+      assert {:ok, true} =
+               Quicksand.eval(rt, "Array.isArray([]) && typeof globalThis === 'object'")
+    end
+
+    test "callbacks keep working after a script replaces builtins", %{rt: rt} do
+      callbacks = %{"f" => fn [x] -> {:ok, x + 1} end}
+      code = "Array.from = () => { throw new Error('mine') }; delete globalThis.Object; f(1)"
+      assert {:ok, 2} = Quicksand.eval(rt, code, callbacks)
+      assert {:ok, 3} = Quicksand.eval(rt, "f(2)", callbacks)
+    end
+
+    test "a callback kept past its eval cannot be called", %{rt: rt} do
+      callbacks = %{"f" => fn [] -> {:ok, 1} end}
+      assert {:ok, nil} = Quicksand.eval(rt, "globalThis.kept = f; null", callbacks)
+      assert {:error, msg} = Quicksand.eval(rt, "kept()")
+      assert msg =~ "Callback 'f' called after its eval ended"
+      assert {:error, msg} = Quicksand.eval(rt, "kept()", callbacks)
+      assert msg =~ "Callback 'f' called after its eval ended"
     end
 
     test "a __proto__ key in a callback result is an own property", %{rt: rt} do
