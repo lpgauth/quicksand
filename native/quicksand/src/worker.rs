@@ -5,6 +5,7 @@ use std::sync::mpsc::{Receiver, Sender};
 use std::sync::Arc;
 use std::time::Instant;
 
+use rquickjs::function::Rest;
 use rquickjs::object::Property;
 use rquickjs::{
     CatchResultExt, CaughtError, Context, Ctx, Exception, Function, Object, Persistent, Runtime,
@@ -32,23 +33,6 @@ const GC_THRESHOLD: usize = 4 * 1024 * 1024;
 // of leaking into the next eval. Short jobs can keep queueing more, so the
 // drain is capped.
 const MAX_JOBS_AFTER_INTERRUPT: usize = 10_000;
-
-// Installed once per runtime and frozen so user JS cannot replace it. Callback
-// names are passed in as an argument, never interpolated into source.
-const WRAPPER_FACTORY: &str = r"Object.defineProperty(globalThis, '__quicksand_make_wrapper', {
-    value: function(name) {
-        return function() {
-            globalThis.__quicksand_cb_args = Array.from(arguments);
-            globalThis.__quicksand_dispatch(name);
-            var r = globalThis.__quicksand_cb_result;
-            delete globalThis.__quicksand_cb_result;
-            return r;
-        };
-    },
-    writable: false,
-    configurable: false,
-    enumerable: false
-})";
 
 pub struct EvalRequest {
     pub code: String,
@@ -99,25 +83,17 @@ impl Worker {
 
         let context = Context::full(&runtime)
             .map_err(|error| format!("Failed to create QuickJS context: {error}"))?;
-        let (describe_property, define_property) = context.with(|ctx| {
-            ctx.eval::<(), _>(WRAPPER_FACTORY)
-                .catch(&ctx)
-                .map_err(|error| format!("Failed to install wrapper factory: {error:?}"))?;
-            let object: Object = ctx
-                .globals()
-                .get("Object")
-                .map_err(|error| format!("Failed to get Object: {error}"))?;
-            let describe: Function = object
-                .get("getOwnPropertyDescriptor")
-                .map_err(|error| format!("Failed to get getOwnPropertyDescriptor: {error}"))?;
-            let define: Function = object
-                .get("defineProperty")
-                .map_err(|error| format!("Failed to get defineProperty: {error}"))?;
-            Ok::<_, String>((
-                Persistent::save(&ctx, describe),
-                Persistent::save(&ctx, define),
-            ))
-        })?;
+        let (describe_property, define_property) = context
+            .with(|ctx| {
+                let object: Object = ctx.globals().get("Object")?;
+                let describe: Function = object.get("getOwnPropertyDescriptor")?;
+                let define: Function = object.get("defineProperty")?;
+                Ok::<_, rquickjs::Error>((
+                    Persistent::save(&ctx, describe),
+                    Persistent::save(&ctx, define),
+                ))
+            })
+            .map_err(|error| format!("Failed to capture Object functions: {error}"))?;
 
         Ok(Self {
             describe_property,
@@ -182,14 +158,7 @@ impl Worker {
     }
 
     fn eval(&self, request: &EvalRequest) -> EvalResult {
-        // rquickjs 0.14 hands the source to QuickJS as a C string, so it
-        // rejects NUL bytes. `\u0000` reads the same inside strings, comments
-        // and regexes, and a raw NUL anywhere else is a syntax error anyway.
-        let code = if request.code.contains('\0') {
-            Cow::Owned(request.code.replace('\0', "\\u0000"))
-        } else {
-            Cow::Borrowed(request.code.as_str())
-        };
+        let code = escape_nul(&request.code);
 
         self.context.with(|ctx| {
             let mut shadowed = Vec::new();
@@ -229,7 +198,7 @@ impl Worker {
         }
     }
 
-    /// Installs a wrapper global per callback, pushing the property
+    /// Defines a global function per callback, pushing the property
     /// descriptor each one replaces (or `undefined`) onto `shadowed`.
     fn install_callbacks<'js>(
         &self,
@@ -242,14 +211,6 @@ impl Worker {
         }
 
         let globals = ctx.globals();
-        let dispatch = self.dispatch_function(ctx, request.caller, request.tag)?;
-        globals
-            .set("__quicksand_dispatch", dispatch)
-            .map_err(|error| format!("Failed to set __quicksand_dispatch: {error}"))?;
-
-        let make_wrapper: Function = globals
-            .get("__quicksand_make_wrapper")
-            .map_err(|error| format!("Failed to get wrapper factory: {error}"))?;
         let describe_property = self
             .describe_property
             .clone()
@@ -261,97 +222,90 @@ impl Worker {
                 .call((globals.clone(), name.as_str()))
                 .catch(ctx)
                 .map_err(|error| format!("Failed to read global {name}: {error:?}"))?;
-            let wrapper: Function = make_wrapper
-                .call((name.as_str(),))
-                .catch(ctx)
-                .map_err(|error| format!("Failed to create wrapper for {name}: {error:?}"))?;
+            let callback = self.callback_function(ctx, name, request.caller, request.tag)?;
             // Defined rather than assigned, so a name like `__proto__` becomes
             // an own property instead of replacing the global's prototype.
             let defined = if previous.is_undefined() {
-                let property = Property::from(wrapper).writable().configurable();
+                let property = Property::from(callback).writable().configurable();
                 globals.prop(name.as_str(), property)
             } else {
-                globals.prop(name.as_str(), wrapper)
+                globals.prop(name.as_str(), callback)
             };
             defined
                 .catch(ctx)
-                .map_err(|error| format!("Failed to set wrapper for {name}: {error:?}"))?;
+                .map_err(|error| format!("Failed to define callback {name}: {error:?}"))?;
             shadowed.push(previous);
         }
 
         Ok(())
     }
 
-    /// Builds `__quicksand_dispatch(name)`, which sends the arguments the
-    /// wrapper left in `__quicksand_cb_args` to the caller and leaves the
-    /// reply in `__quicksand_cb_result`, so no JS value has to outlive the
-    /// call.
-    fn dispatch_function<'js>(
+    /// Builds the JS function for callback `name`: it sends its arguments to
+    /// the caller and returns the reply. Being native, it depends on no JS
+    /// global that user code could replace.
+    fn callback_function<'js>(
         &self,
         ctx: &Ctx<'js>,
+        name: &str,
         caller: LocalPid,
         tag: u64,
     ) -> Result<Function<'js>, String> {
         let registry = Arc::clone(&self.registry);
         let interrupt = Arc::clone(&self.interrupt);
         let memory_limit = self.memory_limit;
+        let callback_name = name.to_string();
 
-        Function::new(
-            ctx.clone(),
-            move |ctx: Ctx<'_>, name: String| -> rquickjs::Result<()> {
-                if interrupt.is_due() || registry.is_abandoned(tag) {
-                    let message =
-                        format!("Callback '{name}' called after the eval was interrupted");
-                    return Err(Exception::throw_message(&ctx, &message));
-                }
+        let callback = move |ctx: Ctx<'js>, arguments: Rest<Value<'js>>| {
+            let name = callback_name.as_str();
+            if interrupt.is_due() {
+                let message = format!("Callback '{name}' called after the eval was interrupted");
+                return Err(Exception::throw_message(&ctx, &message));
+            }
+            if registry.is_abandoned(tag) {
+                let message = format!("Callback '{name}' called after its eval ended");
+                return Err(Exception::throw_message(&ctx, &message));
+            }
 
-                let arguments: Value = ctx.globals().get("__quicksand_cb_args")?;
-                let arguments = match Converter::new(&ctx, &interrupt, memory_limit)
-                    .convert(arguments)
-                {
-                    Ok(JsValue::Array(items)) => items,
-                    Ok(other) => vec![other],
+            let mut converter = Converter::new(&ctx, &interrupt, memory_limit);
+            let mut converted = Vec::with_capacity(arguments.len());
+            for argument in arguments.into_inner() {
+                match converter.convert(argument) {
+                    Ok(value) => converted.push(value),
                     Err(reason) => {
                         let message = format!("Failed to convert arguments for '{name}': {reason}");
                         return Err(Exception::throw_message(&ctx, &message));
                     }
-                };
-
-                let (id, reply) = registry.register();
-                let message = (
-                    atoms::quicksand_callback(),
-                    tag,
-                    id,
-                    name.as_str(),
-                    arguments,
-                );
-                if !runtime::send_to_pid(caller, message) {
-                    let message = format!("Callback '{name}' has no caller to run it");
-                    return Err(Exception::throw_message(&ctx, &message));
                 }
+            }
 
-                match reply.recv_timeout(interrupt.remaining()) {
-                    Ok(Ok(term_value)) => {
-                        let value =
-                            convert::intermediate_to_js(&ctx, &term_value).map_err(|reason| {
-                                let message =
-                                    format!("Failed to convert result of '{name}': {reason}");
-                                Exception::throw_message(&ctx, &message)
-                            })?;
-                        ctx.globals().set("__quicksand_cb_result", value)
-                    }
-                    Ok(Err(reason)) => Err(Exception::throw_message(&ctx, &reason)),
-                    Err(_) => {
-                        let message = format!("Callback '{name}' timed out");
-                        Err(Exception::throw_message(&ctx, &message))
-                    }
+            let (id, reply) = registry.register();
+            let message = (atoms::quicksand_callback(), tag, id, name, converted);
+            if !runtime::send_to_pid(caller, message) {
+                let message = format!("Callback '{name}' has no caller to run it");
+                return Err(Exception::throw_message(&ctx, &message));
+            }
+
+            match reply.recv_timeout(interrupt.remaining()) {
+                Ok(Ok(term_value)) => {
+                    convert::intermediate_to_js(&ctx, &term_value).map_err(|reason| {
+                        let message = format!("Failed to convert result of '{name}': {reason}");
+                        Exception::throw_message(&ctx, &message)
+                    })
                 }
-            },
-        )
-        .map_err(|error| format!("Failed to create __quicksand_dispatch: {error}"))
+                Ok(Err(reason)) => Err(Exception::throw_message(&ctx, &reason)),
+                Err(_) => {
+                    let message = format!("Callback '{name}' timed out");
+                    Err(Exception::throw_message(&ctx, &message))
+                }
+            }
+        };
+
+        Function::new(ctx.clone(), callback)
+            .and_then(|function| function.with_name(name))
+            .map_err(|error| format!("Failed to create callback {name}: {error}"))
     }
 
-    /// Removes the callback globals and puts back what each one shadowed.
+    /// Puts back what each callback global shadowed.
     fn remove_callbacks<'js>(
         &self,
         ctx: &Ctx<'js>,
@@ -363,10 +317,6 @@ impl Worker {
         }
 
         let globals = ctx.globals();
-        let _ = globals.remove("__quicksand_dispatch");
-        let _ = globals.remove("__quicksand_cb_args");
-        let _ = globals.remove("__quicksand_cb_result");
-
         let define_property = self.define_property.clone().restore(ctx).ok();
         for (name, previous) in callback_names.iter().zip(shadowed) {
             match (&define_property, previous.is_undefined()) {
@@ -381,6 +331,33 @@ impl Worker {
             }
         }
     }
+}
+
+/// rquickjs 0.14 hands the source to QuickJS as a C string, so it rejects NUL
+/// bytes. `\u0000` reads the same inside strings, comments and regexes, and a
+/// raw NUL anywhere else is a syntax error anyway. After an odd run of
+/// backslashes the last one already starts an escape, so only `u0000` is
+/// added.
+fn escape_nul(code: &str) -> Cow<'_, str> {
+    if !code.contains('\0') {
+        return Cow::Borrowed(code);
+    }
+
+    let mut escaped = String::with_capacity(code.len() + 16);
+    let mut backslashes = 0_usize;
+    for character in code.chars() {
+        match character {
+            '\0' if backslashes % 2 == 1 => escaped.push_str("u0000"),
+            '\0' => escaped.push_str("\\u0000"),
+            _ => escaped.push(character),
+        }
+        backslashes = if character == '\\' {
+            backslashes + 1
+        } else {
+            0
+        };
+    }
+    Cow::Owned(escaped)
 }
 
 /// Returns a promise's settled value, or the value itself if it is not one.

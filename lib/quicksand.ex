@@ -6,16 +6,6 @@ defmodule Quicksand do
   with pre-registered Elixir callback functions callable from JS.
   Each runtime runs on a dedicated OS thread with configurable
   memory and time limits.
-
-  ## Reserved JS globals
-
-  When using `eval/3` in callback mode, quicksand installs four
-  `globalThis.__quicksand_*` properties on the JS runtime:
-  `__quicksand_make_wrapper`, `__quicksand_dispatch`,
-  `__quicksand_cb_args`, `__quicksand_cb_result`. User JavaScript
-  must not overwrite these or the callback machinery silently
-  breaks for that runtime. See `README.md` for the full list and
-  rationale.
   """
 
   @default_timeout 30_000
@@ -72,6 +62,15 @@ defmodule Quicksand do
         after
           5_000 ->
             stop(runtime)
+
+            # stop returns after the worker stops. If the worker sent a reply
+            # before it stopped, that reply is now in the mailbox. Remove it.
+            receive do
+              {:quicksand_start, ^ref, _} -> :ok
+            after
+              0 -> :ok
+            end
+
             {:error, :start_timeout}
         end
 
@@ -95,12 +94,11 @@ defmodule Quicksand do
   @doc """
   Evaluate JavaScript code with pre-registered Elixir callbacks.
 
-  Callback names are strings or atoms; names starting with
-  `__quicksand_` are reserved. Each callback receives its arguments as
-  a list and must return `{:ok, value}` or `{:error, reason}`. Errors,
-  raises, throws and exits become JS exceptions. A callback cannot eval
-  on the runtime that is running it, since that runtime is busy waiting
-  for the callback.
+  Callback names are strings or atoms. Each callback receives its
+  arguments as a list and must return `{:ok, value}` or
+  `{:error, reason}`. Errors, raises, throws and exits become JS
+  exceptions. A callback cannot eval on the runtime that is running it,
+  since that runtime is busy waiting for the callback.
 
       callbacks = %{
         "add" => fn [a, b] -> {:ok, a + b} end
@@ -163,21 +161,24 @@ defmodule Quicksand do
   end
 
   defp normalize_callbacks!(callbacks) do
-    Map.new(callbacks, fn {name, fun} -> {callback_name!(name), fun} end)
+    normalized = Map.new(callbacks, fn {name, fun} -> {callback_name!(name), fun} end)
+
+    if map_size(normalized) != map_size(callbacks) do
+      raise ArgumentError,
+            "callback names must be unique once atoms become strings, got: " <>
+              inspect(Map.keys(callbacks))
+    end
+
+    normalized
   end
 
   defp callback_name!(name) when is_atom(name), do: callback_name!(Atom.to_string(name))
 
   defp callback_name!(name) when is_binary(name) do
-    cond do
-      not String.valid?(name) ->
-        raise ArgumentError, "callback names must be valid UTF-8, got: #{inspect(name)}"
-
-      String.starts_with?(name, "__quicksand_") ->
-        raise ArgumentError, "callback names starting with __quicksand_ are reserved"
-
-      true ->
-        name
+    if String.valid?(name) do
+      name
+    else
+      raise ArgumentError, "callback names must be valid UTF-8, got: #{inspect(name)}"
     end
   end
 

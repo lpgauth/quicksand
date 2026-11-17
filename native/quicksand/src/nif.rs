@@ -53,6 +53,10 @@ fn start_runtime(
             "max_stack_size must be between 1 and {MAX_STACK_SIZE}"
         ));
     }
+    // QuickJS treats a limit of 0 as no limit at all.
+    if memory_limit == 0 {
+        return Err("memory_limit must be positive".to_string());
+    }
 
     let (sender, receiver) = mpsc::channel::<Message>();
     let registry = Arc::new(CallbackRegistry::default());

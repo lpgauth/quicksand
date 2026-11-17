@@ -21,6 +21,10 @@ const MAX_DEPTH: u32 = 64;
 /// The largest integer a JS number holds exactly (`Number.MAX_SAFE_INTEGER`).
 const MAX_SAFE_INTEGER: f64 = 9_007_199_254_740_991.0;
 
+/// How many `cause` links an error description follows, which also stops
+/// cycles.
+const MAX_CAUSES: u32 = 8;
+
 /// How many values to convert between checks of the eval's deadline.
 const INTERRUPT_CHECK_INTERVAL: usize = 1024;
 
@@ -57,8 +61,17 @@ impl Encoder for JsValue {
             JsValue::Object(pairs) => {
                 let keys: Vec<Term> = pairs.iter().map(|(key, _)| key.encode(env)).collect();
                 let values: Vec<Term> = pairs.iter().map(|(_, value)| value.encode(env)).collect();
-                Term::map_from_arrays(env, &keys, &values)
-                    .unwrap_or_else(|_| atom::nil().encode(env))
+                Term::map_from_arrays(env, &keys, &values).unwrap_or_else(|_| {
+                    // Keys repeat when lone surrogates in distinct JS keys all
+                    // become U+FFFD. The last one wins.
+                    let mut map = Term::map_new(env);
+                    for (key, value) in keys.iter().zip(&values) {
+                        if let Ok(updated) = map.map_put(*key, *value) {
+                            map = updated;
+                        }
+                    }
+                    map
+                })
             }
         }
     }
@@ -240,15 +253,20 @@ pub fn describe_error(ctx: &Ctx<'_>, error: rquickjs::Error) -> String {
 }
 
 /// Describes a thrown JS value as an `{:error, message}` string: an `Error`'s
-/// message and stack, a string as itself, and anything else as JSON or its
-/// `String()` form.
+/// message and stack followed by its causes, a string as itself, and anything
+/// else as JSON or its `String()` form.
 pub fn describe_thrown<'js>(ctx: &Ctx<'js>, value: Value<'js>) -> String {
     // QuickJS throws null when it cannot allocate the out-of-memory error
     // itself. A script throwing null literally is reported the same way.
     if value.is_null() {
         return OUT_OF_MEMORY.to_string();
     }
+    describe_with_causes(ctx, value, 0)
+}
 
+/// Describes `value` as `describe_thrown` does, after `causes` links of an
+/// error's `cause` chain.
+fn describe_with_causes<'js>(ctx: &Ctx<'js>, value: Value<'js>, causes: u32) -> String {
     if let Some(string) = value.as_string() {
         return to_rust_string(ctx, string).unwrap_or_default();
     }
@@ -259,10 +277,22 @@ pub fn describe_thrown<'js>(ctx: &Ctx<'js>, value: Value<'js>) -> String {
             message = string_property(ctx, object, "name");
         }
         let stack = string_property(ctx, object, "stack");
-        return if stack.is_empty() {
+        let description = if stack.is_empty() {
             message
         } else {
             format!("{message}\n{stack}")
+        };
+        let cause = if causes < MAX_CAUSES {
+            error_cause(ctx, object)
+        } else {
+            None
+        };
+        return match cause {
+            Some(cause) => {
+                let cause = describe_with_causes(ctx, cause, causes + 1);
+                format!("{}\nCaused by: {cause}", description.trim_end())
+            }
+            None => description,
         };
     }
 
@@ -285,6 +315,17 @@ pub fn describe_thrown<'js>(ctx: &Ctx<'js>, value: Value<'js>) -> String {
         Err(_) => {
             ctx.catch();
             value.type_name().to_string()
+        }
+    }
+}
+
+fn error_cause<'js>(ctx: &Ctx<'js>, error: &Object<'js>) -> Option<Value<'js>> {
+    match error.get::<_, Value>("cause") {
+        Ok(cause) if !cause.is_undefined() => Some(cause),
+        Ok(_) => None,
+        Err(_) => {
+            ctx.catch();
+            None
         }
     }
 }
