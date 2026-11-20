@@ -883,6 +883,17 @@ defmodule QuicksandTest do
       Quicksand.stop(rt)
     end
 
+    test "runtime recovers from cyclic garbage that filled a mostly live heap" do
+      {:ok, rt} = Quicksand.start(memory_limit: 8 * 1024 * 1024)
+      assert {:ok, 1} = Quicksand.eval(rt, "globalThis.keep = new Uint8Array(6 << 20); 1")
+      code = "for (let i = 0; i < 200000; i++) { const a = {}; a.self = a } 'done'"
+      assert {:error, message} = Quicksand.eval(rt, code)
+      assert message =~ "out of memory"
+      assert {:ok, 2} = Quicksand.eval(rt, "1 + 1")
+      assert {:ok, 6_291_456} = Quicksand.eval(rt, "keep.length")
+      Quicksand.stop(rt)
+    end
+
     test "results count toward the memory limit" do
       {:ok, rt} = Quicksand.start(memory_limit: 1024 * 1024)
       assert {:error, "out of memory"} = Quicksand.eval(rt, "var a = []; a.length = 5e6; a")
