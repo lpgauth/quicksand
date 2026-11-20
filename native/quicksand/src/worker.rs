@@ -77,7 +77,7 @@ impl Worker {
             Runtime::new().map_err(|error| format!("Failed to create QuickJS runtime: {error}"))?;
         runtime.set_memory_limit(options.memory_limit);
         runtime.set_max_stack_size(options.max_stack_size);
-        runtime.set_gc_threshold(GC_THRESHOLD.min(options.memory_limit / 2));
+        runtime.set_gc_threshold(gc_threshold(options.memory_limit));
         let handler_interrupt = Arc::clone(&interrupt);
         runtime.set_interrupt_handler(Some(Box::new(move || handler_interrupt.is_due())));
 
@@ -136,8 +136,20 @@ impl Worker {
             None => self.eval(request),
         };
         self.interrupt.clear_deadline();
+        if matches!(&result, Err(message) if message.contains(convert::OUT_OF_MEMORY)) {
+            self.collect_garbage();
+        }
         self.registry.clear();
         self.reply(request, result);
+    }
+
+    // After each collection QuickJS moves its threshold to 1.5 times the live
+    // heap. Once that is past the memory limit it never collects cycles again,
+    // so the garbage that filled the heap would fail every later eval.
+    fn collect_garbage(&self) {
+        let runtime = self.context.runtime();
+        runtime.run_gc();
+        runtime.set_gc_threshold(gc_threshold(self.memory_limit));
     }
 
     fn reply(&self, request: &EvalRequest, result: EvalResult) {
@@ -331,6 +343,10 @@ impl Worker {
             }
         }
     }
+}
+
+fn gc_threshold(memory_limit: usize) -> usize {
+    GC_THRESHOLD.min(memory_limit / 2)
 }
 
 /// rquickjs 0.14 hands the source to QuickJS as a C string, so it rejects NUL

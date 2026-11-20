@@ -28,7 +28,7 @@ const MAX_CAUSES: u32 = 8;
 /// How many values to convert between checks of the eval's deadline.
 const INTERRUPT_CHECK_INTERVAL: usize = 1024;
 
-const OUT_OF_MEMORY: &str = "out of memory";
+pub const OUT_OF_MEMORY: &str = "out of memory";
 
 /// A callback's reply: the value to return to JS, or the message to throw.
 pub type CallbackReply = Result<TermValue, String>;
